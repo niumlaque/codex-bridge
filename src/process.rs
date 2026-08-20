@@ -6,6 +6,7 @@
 
 use std::{env, path::Path, process::Stdio};
 
+use processkit::ProcessGroup;
 use tokio::{
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot},
@@ -14,18 +15,16 @@ use tokio::{
 
 use crate::{ClientConfig, ClientError, EnvironmentPolicy, state::ShutdownReport};
 
-/// Unix process group 全体を即時終了する signal。
-const SIGKILL: i32 = 9;
-
-unsafe extern "C" {
-    #[link_name = "kill"]
-    fn libc_kill(pid: i32, signal: i32) -> i32;
+/// direct child の reap handle と process tree containment の ownership。
+pub(crate) struct SupervisedChild {
+    child: Child,
+    process_group: ProcessGroup,
 }
 
 /// spawn 後に runtime task へ ownership を分配する child process と pipe 群。
 pub(crate) struct SpawnedProcess {
     /// process supervisor が終了と reap を所有する child handle。
-    pub child: Child,
+    pub child: SupervisedChild,
     /// single writer task だけが所有する stdin pipe。
     pub stdin: ChildStdin,
     /// JSONL reader task だけが所有する stdout pipe。
@@ -67,17 +66,14 @@ pub(crate) fn spawn_process(config: &ClientConfig) -> Result<SpawnedProcess, Cli
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        // group ID 0 は child 自身の PID を leader とする新しい process group を作成する。
-        .process_group(0);
-    let mut child = command.spawn().map_err(|error| ClientError::SpawnFailed {
+        .kill_on_drop(true);
+    let process_group = ProcessGroup::new().map_err(|error| ClientError::SpawnFailed {
         detail: error.to_string(),
     })?;
-    child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .ok_or_else(|| ClientError::SpawnFailed {
-            detail: "app-server did not expose a valid process ID".to_owned(),
+    let mut child = process_group
+        .spawn(command)
+        .map_err(|error| ClientError::SpawnFailed {
+            detail: error.to_string(),
         })?;
     let stdin = child
         .stdin
@@ -92,7 +88,10 @@ pub(crate) fn spawn_process(config: &ClientConfig) -> Result<SpawnedProcess, Cli
         .take()
         .ok_or(ClientError::MissingPipe { pipe: "stderr" })?;
     Ok(SpawnedProcess {
-        child,
+        child: SupervisedChild {
+            child,
+            process_group,
+        },
         stdin,
         stdout,
         stderr,
@@ -104,28 +103,26 @@ pub(crate) fn spawn_process(config: &ClientConfig) -> Result<SpawnedProcess, Cli
 /// `biased` select により、同時に ready になった場合は明示的な shutdown/kill command を process exit より先に扱う。
 ///これにより正常 shutdown 中の exit を unexpected failure と誤分類しにくくする。
 pub(crate) async fn supervise<F>(
-    mut child: Child,
+    mut supervised: SupervisedChild,
     mut receiver: mpsc::Receiver<ProcessCommand>,
     on_unexpected_exit: F,
 ) where
     F: Fn(ClientError) -> bool,
 {
-    let process_group = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .unwrap_or_default();
+    let child = &mut supervised.child;
+    let process_group = &supervised.process_group;
     tokio::select! {
         biased;
         command = receiver.recv() => match command {
             Some(ProcessCommand::Shutdown { deadline, reply }) => {
-                let result = shutdown_child(&mut child, process_group, deadline).await;
+                let result = shutdown_child(child, process_group, deadline).await;
                 let _ = reply.send(result);
             }
             Some(ProcessCommand::StdoutClosed) => {
                 let error = match child.try_wait() {
                     Ok(Some(status)) => {
                         // child が終了済みでも、同じ group に残った descendant は明示的に cleanup する。
-                        kill_process_group(process_group);
+                        kill_process_group(process_group).await;
                         ClientError::ProcessExited { status: status.to_string() }
                     }
                     Ok(None) => ClientError::StdoutClosed,
@@ -134,23 +131,23 @@ pub(crate) async fn supervise<F>(
                     },
                 };
                 if on_unexpected_exit(error) {
-                    kill_and_reap(&mut child, process_group).await;
+                    kill_and_reap(child, process_group).await;
                 } else {
-                    finish_stopping(&mut child, process_group, &mut receiver).await;
+                    finish_stopping(child, process_group, &mut receiver).await;
                 }
             }
             Some(ProcessCommand::Kill) | None => {
-                kill_and_reap(&mut child, process_group).await;
+                kill_and_reap(child, process_group).await;
             }
         },
         status = child.wait() => {
-            kill_process_group(process_group);
+            kill_process_group(process_group).await;
             let error = match status {
                 Ok(status) => ClientError::ProcessExited { status: status.to_string() },
                 Err(error) => ClientError::ProcessExited { status: format!("wait failed: {error}") },
             };
             if !on_unexpected_exit(error) {
-                finish_stopping(&mut child, process_group, &mut receiver).await;
+                finish_stopping(child, process_group, &mut receiver).await;
             }
         }
     }
@@ -159,7 +156,7 @@ pub(crate) async fn supervise<F>(
 /// failure が既に runtime へ記録された後も、shutdown caller へ一意な reply を返すまで supervisor を維持する。
 async fn finish_stopping(
     child: &mut Child,
-    process_group: i32,
+    process_group: &ProcessGroup,
     receiver: &mut mpsc::Receiver<ProcessCommand>,
 ) {
     loop {
@@ -182,14 +179,14 @@ async fn finish_stopping(
 /// deadline までは child の natural exit を polling し、超過後は process group を kill して reap する。
 async fn shutdown_child(
     child: &mut Child,
-    process_group: i32,
+    process_group: &ProcessGroup,
     deadline: Instant,
 ) -> Result<ShutdownReport, ClientError> {
     loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 // leader が終了していても descendant が残っている可能性を cleanup result に反映する。
-                let forced = kill_process_group(process_group);
+                let forced = kill_process_group(process_group).await;
                 return Ok(ShutdownReport { forced });
             }
             Ok(None) if Instant::now() < deadline => sleep(Duration::from_millis(10)).await,
@@ -208,22 +205,20 @@ async fn shutdown_child(
 }
 
 /// process group と child handle の両方へ kill を発行し、wait 完了まで ownership を保持する。
-async fn kill_and_reap(child: &mut Child, process_group: i32) {
-    kill_process_group(process_group);
+async fn kill_and_reap(child: &mut Child, process_group: &ProcessGroup) {
+    kill_process_group(process_group).await;
     let _ = child.start_kill();
     let _ = child.wait().await;
 }
 
-/// child を leader とする process group 全体へ SIGKILL を送る。
+/// containment 内の process tree 全体を hard kill する。
 ///
-/// return value は signal delivery syscall が成功したかを示し、既に process group が消滅している場合は `false` となる。
-fn kill_process_group(process_group: i32) -> bool {
-    if process_group <= 0 {
-        return false;
-    }
-    // SAFETY: negative PID は、この child 用に作成した process group を指定する。
-    // SIGKILL は failure、Drop、shutdown cleanup の経路だけで使用する。
-    unsafe { libc_kill(-process_group, SIGKILL) == 0 }
+/// return value は processkit が hard kill へ escalation したかを示す。cleanup failure は best-effort とする。
+async fn kill_process_group(process_group: &ProcessGroup) -> bool {
+    process_group
+        .stop(Duration::ZERO, true)
+        .await
+        .is_ok_and(|report| report.escalated())
 }
 
 #[allow(dead_code)]

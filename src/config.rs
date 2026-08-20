@@ -205,10 +205,14 @@ mod tests {
     use super::*;
 
     fn dirs() -> (PathBuf, PathBuf) {
+        let test_name = std::thread::current()
+            .name()
+            .unwrap_or("test")
+            .replace("::", "__");
         let root = std::env::temp_dir().join(format!(
             "codex-client-config-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            test_name
         ));
         let home = root.join("home");
         let cwd = root.join("cwd");
