@@ -34,13 +34,14 @@ pub use server_request::{
 pub(crate) use server_request::{TypedServerRequestKind, typed_server_request_kind};
 pub(crate) use thread::ThreadStartResponse;
 pub use thread::{
-    ApprovalsReviewer, AskForApproval, GranularApprovalPolicy, Personality, SandboxMode,
-    SimpleApprovalPolicy, ThreadActiveFlag, ThreadId, ThreadStartOutcome, ThreadStartParams,
-    ThreadStartSource, ThreadStatus,
+    ApprovalsReviewer, AskForApproval, DynamicToolFunctionSpec, DynamicToolSpec,
+    GranularApprovalPolicy, Personality, SandboxMode, SimpleApprovalPolicy, ThreadActiveFlag,
+    ThreadId, ThreadStartOutcome, ThreadStartParams, ThreadStartSource, ThreadStatus,
+    TurnEnvironmentParams,
 };
 pub use turn::{
-    ByteRange, ImageDetail, NetworkAccess, ReasoningEffort, ReasoningSummary, SandboxPolicy,
-    TextElement, ThreadItem, Turn, TurnError, TurnId, TurnOutcome, TurnStartParams, TurnStatus,
-    UserInput,
+    AdditionalContextEntry, AdditionalContextKind, ByteRange, ImageDetail, NetworkAccess,
+    ReasoningEffort, ReasoningSummary, SandboxPolicy, TextElement, ThreadItem, Turn, TurnError,
+    TurnId, TurnOutcome, TurnStartParams, TurnStatus, UserInput,
 };
 pub(crate) use turn::{TurnCompletedParams, TurnStartResponse};

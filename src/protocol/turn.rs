@@ -3,7 +3,7 @@
 //! app-server Schema は多数の item kind を持つが、client が直接利用する agent message だけを専用 variant とし、
 //!その他は validated raw JSON として保持する。これにより Schema validation を維持しながら future item kind を失わない。
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -159,6 +159,21 @@ pub enum NetworkAccess {
     Enabled,
 }
 
+/// client-supplied context の trust classification。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AdditionalContextKind {
+    Untrusted,
+    Application,
+}
+
+/// turn/start でモデルへ追加する caller context。
+#[derive(Clone, Debug, Serialize)]
+pub struct AdditionalContextEntry {
+    pub value: String,
+    pub kind: AdditionalContextKind,
+}
+
 /// turn/start request parameter。
 ///
 /// [`TurnStartParams::new`] は thread ID と input だけを必須とし、その他の field は thread default を
@@ -170,6 +185,9 @@ pub struct TurnStartParams {
     pub thread_id: ThreadId,
     ///今回の user input sequence。
     pub input: Vec<UserInput>,
+    /// client-supplied context fragments。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_context: Option<HashMap<String, AdditionalContextEntry>>,
     /// thread policy を turn 単位で上書きする approval policy。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<AskForApproval>,
@@ -211,6 +229,7 @@ impl TurnStartParams {
         Self {
             thread_id,
             input,
+            additional_context: None,
             approval_policy: None,
             approvals_reviewer: None,
             client_user_message_id: None,
@@ -517,11 +536,23 @@ mod tests {
             network_access: Some(NetworkAccess::Restricted),
         });
         params.effort = Some(ReasoningEffort::new("medium").unwrap());
+        params.additional_context = Some(HashMap::from([(
+            "prep_board".to_owned(),
+            AdditionalContextEntry {
+                value: "board snapshot".to_owned(),
+                kind: AdditionalContextKind::Untrusted,
+            },
+        )]));
         let value = serde_json::to_value(params).unwrap();
         assert_eq!(value["threadId"], "thread-1");
         assert_eq!(value["input"][0]["type"], "text");
         assert_eq!(value["sandboxPolicy"]["type"], "externalSandbox");
         assert_eq!(value["sandboxPolicy"]["networkAccess"], "restricted");
+        assert_eq!(value["additionalContext"]["prep_board"]["kind"], "untrusted");
+        assert_eq!(
+            value["additionalContext"]["prep_board"]["value"],
+            "board snapshot"
+        );
         assert!(value.get("approvalPolicy").is_none());
     }
 

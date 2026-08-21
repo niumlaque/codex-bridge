@@ -107,6 +107,34 @@ pub enum Personality {
     Pragmatic,
 }
 
+/// thread/start で登録する dynamic tool。
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum DynamicToolSpec {
+    Function(DynamicToolFunctionSpec),
+}
+
+/// client process 内で実行する dynamic function tool の定義。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicToolFunctionSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub defer_loading: bool,
+}
+
+/// thread に固定する app-server environment の選択。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnEnvironmentParams {
+    pub environment_id: String,
+    pub cwd: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_workspace_roots: Option<Vec<String>>,
+}
+
 /// thread/start request で default 設定を上書きする optional parameter。
 ///
 /// `None` の field は payload から省略し、app-server 側の default または configuration を維持する。
@@ -149,6 +177,12 @@ pub struct ThreadStartParams {
     /// caller 固有の thread source label。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_source: Option<String>,
+    /// thread に固定する environment 選択。空配列は environment access を無効化する。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environments: Option<Vec<TurnEnvironmentParams>>,
+    /// client process が提供する dynamic tool。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
     /// model service tier override。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,
@@ -274,4 +308,31 @@ pub enum ThreadActiveFlag {
     WaitingOnApproval,
     /// user-input response を待機している。
     WaitingOnUserInput,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn thread_params_serialize_dynamic_tools_and_empty_environments() {
+        let params = ThreadStartParams {
+            environments: Some(Vec::new()),
+            dynamic_tools: Some(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
+                name: "get_board".to_owned(),
+                description: "Get the current board".to_owned(),
+                input_schema: json!({"type": "object", "properties": {}}),
+                defer_loading: false,
+            })]),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["environments"], json!([]));
+        assert_eq!(value["dynamicTools"][0]["type"], "function");
+        assert_eq!(value["dynamicTools"][0]["name"], "get_board");
+        assert!(value["dynamicTools"][0].get("deferLoading").is_none());
+    }
 }
