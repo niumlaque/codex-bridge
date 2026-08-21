@@ -107,32 +107,37 @@ pub enum Personality {
     Pragmatic,
 }
 
-/// thread/start で登録する dynamic tool。
 #[derive(Clone, Debug, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum DynamicToolSpec {
-    Function(DynamicToolFunctionSpec),
+enum DynamicToolType {
+    #[serde(rename = "function")]
+    Function,
 }
 
-/// client process 内で実行する dynamic function tool の定義。
+/// thread/start で登録する client-side function tool。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DynamicToolFunctionSpec {
+pub struct DynamicToolSpec {
+    #[serde(rename = "type")]
+    tool_type: DynamicToolType,
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub defer_loading: bool,
 }
 
-/// thread に固定する app-server environment の選択。
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TurnEnvironmentParams {
-    pub environment_id: String,
-    pub cwd: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime_workspace_roots: Option<Vec<String>>,
+impl DynamicToolSpec {
+    /// client-side function tool を生成する。
+    pub fn function(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        Self {
+            tool_type: DynamicToolType::Function,
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
 }
 
 /// thread/start request で default 設定を上書きする optional parameter。
@@ -179,7 +184,7 @@ pub struct ThreadStartParams {
     pub thread_source: Option<String>,
     /// thread に固定する environment 選択。空配列は environment access を無効化する。
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub environments: Option<Vec<TurnEnvironmentParams>>,
+    pub environments: Option<Vec<Value>>,
     /// client process が提供する dynamic tool。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dynamic_tools: Option<Vec<DynamicToolSpec>>,
@@ -320,12 +325,11 @@ mod tests {
     fn thread_params_serialize_dynamic_tools_and_empty_environments() {
         let params = ThreadStartParams {
             environments: Some(Vec::new()),
-            dynamic_tools: Some(vec![DynamicToolSpec::Function(DynamicToolFunctionSpec {
-                name: "get_board".to_owned(),
-                description: "Get the current board".to_owned(),
-                input_schema: json!({"type": "object", "properties": {}}),
-                defer_loading: false,
-            })]),
+            dynamic_tools: Some(vec![DynamicToolSpec::function(
+                "get_board",
+                "Get the current board",
+                json!({"type": "object", "properties": {}}),
+            )]),
             ..Default::default()
         };
 

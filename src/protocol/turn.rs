@@ -159,19 +159,27 @@ pub enum NetworkAccess {
     Enabled,
 }
 
-/// client-supplied context の trust classification。
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum AdditionalContextKind {
+enum AdditionalContextKind {
     Untrusted,
-    Application,
 }
 
-/// turn/start でモデルへ追加する caller context。
+/// turn/start でモデルへ追加する untrusted caller context。
 #[derive(Clone, Debug, Serialize)]
 pub struct AdditionalContextEntry {
     pub value: String,
-    pub kind: AdditionalContextKind,
+    kind: AdditionalContextKind,
+}
+
+impl AdditionalContextEntry {
+    /// untrusted context fragment を生成する。
+    pub fn untrusted(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            kind: AdditionalContextKind::Untrusted,
+        }
+    }
 }
 
 /// turn/start request parameter。
@@ -538,10 +546,7 @@ mod tests {
         params.effort = Some(ReasoningEffort::new("medium").unwrap());
         params.additional_context = Some(HashMap::from([(
             "prep_board".to_owned(),
-            AdditionalContextEntry {
-                value: "board snapshot".to_owned(),
-                kind: AdditionalContextKind::Untrusted,
-            },
+            AdditionalContextEntry::untrusted("board snapshot"),
         )]));
         let value = serde_json::to_value(params).unwrap();
         assert_eq!(value["threadId"], "thread-1");
