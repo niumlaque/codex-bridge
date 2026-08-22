@@ -16,7 +16,7 @@ mod shutdown;
 mod state;
 mod transport;
 
-pub use client::Client;
+pub use client::{ClaimedServerRequest, Client};
 pub use config::{ClientConfig, EnvironmentPolicy};
 pub use error::ClientError;
 pub use event::{Event, EventReceiver, RawNotification, ServerRequest, ServerRequestKind};

@@ -15,7 +15,7 @@ use crate::runtime::{RequestPermission, Shared};
 use crate::shutdown;
 use crate::state::{ClientState, ShutdownReport};
 use crate::{ClientConfig, ClientError};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{broadcast, mpsc, watch};
@@ -37,6 +37,27 @@ pub struct Client {
     config: Arc<ClientConfig>,
     /// initialize responseでapp-serverが返した実効`CODEX_HOME`。
     codex_home: Arc<str>,
+}
+
+/// response 送信前に local response claim を取得した raw / untyped ServerRequest。
+///
+/// [`Client::claim_server_request`] が成功した場合だけ生成される。response 送信はこの値を消費するため、
+/// 同じ claim から複数回送信することはできない。
+pub struct ClaimedServerRequest {
+    client: Client,
+    request_id: ServerRequestId,
+}
+
+impl ClaimedServerRequest {
+    /// claim 済みServerRequestへraw success responseを送信する。
+    ///
+    /// stdin write が失敗した場合は既存の local claim rollback を行う。
+    pub async fn respond(self, result: Value) -> Result<(), ClientError> {
+        self.client
+            .inner
+            .send_claimed_server_request(self.request_id, json!({"id": null, "result": result}))
+            .await
+    }
 }
 
 impl Clone for Client {
@@ -253,6 +274,22 @@ impl Client {
             .await
     }
 
+    /// raw result を使用できる pending ServerRequest の local response claim を送信前に一度だけ取得する。
+    ///
+    /// typed approval request と user-input request はこの操作では claim できない。
+    pub fn claim_server_request(
+        &self,
+        request_id: ServerRequestId,
+    ) -> Result<ClaimedServerRequest, ClientError> {
+        let result = ServerRequestResult::new(Value::Null);
+        self.inner
+            .claim_server_request(&request_id, Some(&result))?;
+        Ok(ClaimedServerRequest {
+            client: self.clone(),
+            request_id,
+        })
+    }
+
     /// pending ServerRequest を JSON-RPC error response で一度だけ拒否する。
     ///
     /// stdin write が失敗した場合は local claim を rollback するが、transport failure による lifecycle transition を
@@ -289,3 +326,143 @@ impl Client {
 /// payload を持たない JSON-RPC success response を deserialize するための型。
 #[derive(serde::Deserialize)]
 struct EmptyResponse {}
+
+#[cfg(test)]
+mod tests {
+    use crate::{event::ServerRequestKind, protocol::RequestId, transport::Outgoing};
+
+    use super::*;
+
+    fn ready_client() -> (Client, mpsc::Receiver<Outgoing>, watch::Receiver<bool>) {
+        let (outgoing_sender, outgoing_receiver) = mpsc::channel(1);
+        let (event_sender, _) = broadcast::channel(1);
+        let (process_sender, _) = mpsc::channel(1);
+        let (writer_stop, writer_stop_receiver) = watch::channel(false);
+        let inner = Arc::new(Shared::new(
+            outgoing_sender,
+            event_sender,
+            process_sender,
+            writer_stop,
+            std::time::Duration::from_secs(1),
+        ));
+        {
+            let mut state = inner.lock_state();
+            state.begin_initialization();
+            state.finish_initialization().unwrap();
+        }
+        (
+            Client {
+                inner,
+                handles: Arc::new(AtomicUsize::new(1)),
+                config: Arc::new(ClientConfig::new(".", ".")),
+                codex_home: Arc::from(""),
+            },
+            outgoing_receiver,
+            writer_stop_receiver,
+        )
+    }
+
+    fn register_raw_request(client: &Client, request_id: &RequestId) {
+        client
+            .inner
+            .lock_state()
+            .register_server_request(
+                ServerRequest {
+                    id: request_id.clone(),
+                    method: "future/request".to_owned(),
+                    kind: ServerRequestKind::Unsupported,
+                    params: Value::Null,
+                    raw: Value::Null,
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    async fn acknowledge_next_message(receiver: &mut mpsc::Receiver<Outgoing>) -> Value {
+        let Outgoing::Message { value, ack } = receiver.recv().await.unwrap() else {
+            panic!("expected response message");
+        };
+        ack.unwrap().send(Ok(())).unwrap();
+        value
+    }
+
+    #[tokio::test]
+    async fn raw_claim_returns_consumable_value_and_sends_success_response() {
+        let (client, mut outgoing_receiver, _) = ready_client();
+        let request_id = RequestId::String("claimed".to_owned());
+        register_raw_request(&client, &request_id);
+
+        let claimed = client.claim_server_request(request_id.clone()).unwrap();
+
+        assert!(client.pending_server_requests().is_empty());
+        assert!(matches!(
+            client.claim_server_request(request_id.clone()),
+            Err(ClientError::ServerRequestAlreadyResponded { .. })
+        ));
+        let response = tokio::join!(
+            claimed.respond(json!({"accepted": true})),
+            acknowledge_next_message(&mut outgoing_receiver),
+        );
+        response.0.unwrap();
+        assert_eq!(response.1["id"], json!(request_id));
+        assert_eq!(response.1["result"], json!({"accepted": true}));
+    }
+
+    #[tokio::test]
+    async fn failed_claimed_response_send_rolls_back_to_pending() {
+        let (client, outgoing_receiver, _) = ready_client();
+        let request_id = RequestId::String("rollback".to_owned());
+        register_raw_request(&client, &request_id);
+        let claimed = client.claim_server_request(request_id).unwrap();
+        drop(outgoing_receiver);
+
+        assert!(matches!(
+            claimed.respond(Value::Null).await,
+            Err(ClientError::StdinWriteFailed { .. })
+        ));
+        assert_eq!(client.pending_server_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_respond_server_request_still_sends_success_response() {
+        let (client, mut outgoing_receiver, _) = ready_client();
+        let request_id = RequestId::String("existing".to_owned());
+        register_raw_request(&client, &request_id);
+
+        let response = tokio::join!(
+            client.respond_server_request(
+                request_id.clone(),
+                ServerRequestResult::new(json!({"existing": true})),
+            ),
+            acknowledge_next_message(&mut outgoing_receiver),
+        );
+
+        response.0.unwrap();
+        assert_eq!(response.1["id"], json!(request_id));
+        assert_eq!(response.1["result"], json!({"existing": true}));
+    }
+
+    #[tokio::test]
+    async fn claimed_request_keeps_client_alive_after_original_handle_is_dropped() {
+        let (client, mut outgoing_receiver, writer_stop_receiver) = ready_client();
+        let request_id = RequestId::String("lifetime".to_owned());
+        register_raw_request(&client, &request_id);
+        let claimed = client.claim_server_request(request_id.clone()).unwrap();
+        assert_eq!(client.handles.load(Ordering::Acquire), 2);
+
+        drop(client);
+
+        assert!(!*writer_stop_receiver.borrow());
+        let response = tokio::join!(
+            claimed.respond(json!({"alive": true})),
+            acknowledge_next_message(&mut outgoing_receiver),
+        );
+        response.0.unwrap();
+        assert_eq!(response.1["id"], json!(request_id));
+        assert_eq!(response.1["result"], json!({"alive": true}));
+        assert!(*writer_stop_receiver.borrow());
+    }
+}

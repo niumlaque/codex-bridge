@@ -784,6 +784,63 @@ mod tests {
     }
 
     #[test]
+    fn raw_server_request_claim_updates_pending_state_and_is_exclusive() {
+        let mut state = ready_state();
+        let request_id = RequestId::String("raw".to_owned());
+        state
+            .register_server_request(
+                ServerRequest {
+                    id: request_id.clone(),
+                    method: "future/request".to_owned(),
+                    kind: ServerRequestKind::Unsupported,
+                    params: Value::Null,
+                    raw: Value::Null,
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let raw_result = ServerRequestResult::new(json!({"accepted": true}));
+        state
+            .claim_server_request(&request_id, Some(&raw_result))
+            .unwrap();
+
+        assert!(state.pending_server_requests().is_empty());
+        assert!(matches!(
+            state.claim_server_request(&request_id, Some(&raw_result)),
+            Err(ClientError::ServerRequestAlreadyResponded { .. })
+        ));
+    }
+
+    #[test]
+    fn resolved_server_request_cannot_be_claimed() {
+        let mut state = ready_state();
+        let request_id = RequestId::String("resolved".to_owned());
+        state
+            .register_server_request(
+                ServerRequest {
+                    id: request_id.clone(),
+                    method: "future/request".to_owned(),
+                    kind: ServerRequestKind::Unsupported,
+                    params: Value::Null,
+                    raw: Value::Null,
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        state.resolve_server_request(&request_id);
+
+        assert!(matches!(
+            state.claim_server_request(&request_id, Some(&ServerRequestResult::new(Value::Null))),
+            Err(ClientError::UnknownServerRequestId { .. })
+        ));
+    }
+
+    #[test]
     fn permission_result_must_match_permission_request_kind() {
         let mut state = ready_state();
         let request_id = RequestId::String("permission".to_owned());

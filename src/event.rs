@@ -87,7 +87,9 @@ impl fmt::Debug for RawNotification {
 /// app-server から受信し、caller の応答を待っている JSON-RPC request。
 ///
 /// request は [`Client::respond_server_request`](crate::Client::respond_server_request) または
-/// [`Client::reject_server_request`](crate::Client::reject_server_request) で一度だけ claim できる。
+/// [`Client::reject_server_request`](crate::Client::reject_server_request) で直接解決できる。raw result を使用できる
+/// request は [`Client::claim_server_request`](crate::Client::claim_server_request) で送信前に local response claim を
+/// 取得してから応答できる。
 #[derive(Clone)]
 pub struct ServerRequest {
     /// response envelope でそのまま返す server-generated request ID。
