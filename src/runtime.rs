@@ -171,8 +171,6 @@ impl Shared {
             let _ = waiter.send(Err(error.clone()));
         }
         self.publish_event(Event::Failure(error));
-        let _ = self.writer_stop.send(true);
-        let _ = self.process_sender.try_send(ProcessCommand::Kill);
     }
 
     /// typed client request を登録、送信し、対応する response を deserialize する。
@@ -388,5 +386,37 @@ impl Shared {
 
     pub(crate) fn shutdown_timeout(&self) -> Duration {
         self.shutdown_timeout
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    use super::*;
+
+    #[test]
+    fn failure_does_not_stop_writer_or_kill_process() {
+        let (outgoing_sender, _outgoing_receiver) = mpsc::channel(1);
+        let (event_sender, _) = broadcast::channel(1);
+        let (process_sender, mut process_receiver) = mpsc::channel(1);
+        let (writer_stop, writer_stop_receiver) = watch::channel(false);
+        let shared = Shared::new(
+            outgoing_sender,
+            event_sender,
+            process_sender,
+            writer_stop,
+            Duration::from_secs(1),
+        );
+
+        shared.fail(ClientError::ClientFailed {
+            cause: "test".to_owned(),
+        });
+
+        assert!(!*writer_stop_receiver.borrow());
+        assert!(matches!(
+            process_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
     }
 }

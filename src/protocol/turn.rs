@@ -553,7 +553,10 @@ mod tests {
         assert_eq!(value["input"][0]["type"], "text");
         assert_eq!(value["sandboxPolicy"]["type"], "externalSandbox");
         assert_eq!(value["sandboxPolicy"]["networkAccess"], "restricted");
-        assert_eq!(value["additionalContext"]["prep_board"]["kind"], "untrusted");
+        assert_eq!(
+            value["additionalContext"]["prep_board"]["kind"],
+            "untrusted"
+        );
         assert_eq!(
             value["additionalContext"]["prep_board"]["value"],
             "board snapshot"
