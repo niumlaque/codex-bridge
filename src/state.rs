@@ -108,7 +108,7 @@ struct ActiveTurn {
 enum ServerRequestState {
     Pending,
     /// caller が response を claim 済み。write failure 時だけ `Pending` へ rollback できる。
-    Responded,
+    Claimed,
 }
 
 /// response validation と lifecycle cleanup に必要な ServerRequest metadata。
@@ -327,15 +327,15 @@ impl RuntimeState {
         thread_id: Option<ThreadId>,
         turn_id: Option<TurnId>,
     ) -> Result<(), ClientError> {
+        if self.pending_server_requests.contains_key(&request.id) {
+            return Err(ClientError::ProtocolViolation {
+                reason: format!("duplicate ServerRequest ID {}", request.id),
+            });
+        }
         if self.pending_server_requests.len() >= MAX_PENDING_SERVER_REQUESTS {
             return Err(ClientError::CapacityExceeded {
                 resource: "pending ServerRequests",
                 limit: MAX_PENDING_SERVER_REQUESTS,
-            });
-        }
-        if self.pending_server_requests.contains_key(&request.id) {
-            return Err(ClientError::ProtocolViolation {
-                reason: format!("duplicate ServerRequest ID {}", request.id),
             });
         }
         self.pending_server_requests.insert(
@@ -353,7 +353,7 @@ impl RuntimeState {
 
     /// ServerRequest response の exclusive claim と typed result validation を atomically 実行する。
     ///
-    /// actual stdin write は lock の外で行うため、先に `Responded` へ遷移させて concurrent duplicate response を防ぐ。
+    /// actual stdin write は lock の外で行うため、先に `Claimed` へ遷移させて concurrent duplicate response を防ぐ。
     pub(crate) fn claim_server_request(
         &mut self,
         request_id: &ServerRequestId,
@@ -366,7 +366,7 @@ impl RuntimeState {
                     request_id: request_id.clone(),
                 });
             }
-            Some(request) if request.state == ServerRequestState::Responded => {
+            Some(request) if request.state == ServerRequestState::Claimed => {
                 return Err(ClientError::ServerRequestAlreadyResponded {
                     request_id: request_id.clone(),
                 });
@@ -384,7 +384,7 @@ impl RuntimeState {
                 }
             }
         }
-        request.state = ServerRequestState::Responded;
+        request.state = ServerRequestState::Claimed;
         Ok(())
     }
 
@@ -395,6 +395,11 @@ impl RuntimeState {
         {
             request.state = ServerRequestState::Pending;
         }
+    }
+
+    /// response write/flush 成功後、caller response が完了した ServerRequest を local table から除去する。
+    pub(crate) fn complete_server_request_response(&mut self, request_id: &ServerRequestId) {
+        self.pending_server_requests.remove(request_id);
     }
 
     /// app-server 側で解決された ServerRequest を local table から除去する。
@@ -671,7 +676,7 @@ impl RuntimeState {
             .iter_mut()
             .filter_map(|(id, request)| {
                 if request.state == ServerRequestState::Pending {
-                    request.state = ServerRequestState::Responded;
+                    request.state = ServerRequestState::Claimed;
                     Some(id.clone())
                 } else {
                     None
@@ -717,6 +722,16 @@ mod tests {
         state.begin_initialization();
         state.finish_initialization().unwrap();
         state
+    }
+
+    fn raw_server_request(request_id: RequestId) -> ServerRequest {
+        ServerRequest {
+            id: request_id,
+            method: "future/request".to_owned(),
+            kind: ServerRequestKind::Unsupported,
+            params: Value::Null,
+            raw: Value::Null,
+        }
     }
 
     #[test]
@@ -815,6 +830,74 @@ mod tests {
     }
 
     #[test]
+    fn completed_server_request_response_releases_capacity() {
+        let mut state = ready_state();
+        for index in 0..MAX_PENDING_SERVER_REQUESTS {
+            let request_id = RequestId::String(format!("completed-{index}"));
+            state
+                .register_server_request(raw_server_request(request_id.clone()), None, None, None)
+                .unwrap();
+            state.claim_server_request(&request_id, None).unwrap();
+            state.complete_server_request_response(&request_id);
+        }
+
+        state
+            .register_server_request(
+                raw_server_request(RequestId::String("next".to_owned())),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn claimed_server_requests_count_toward_capacity() {
+        let mut state = ready_state();
+        for index in 0..MAX_PENDING_SERVER_REQUESTS {
+            let request_id = RequestId::String(format!("claimed-{index}"));
+            state
+                .register_server_request(raw_server_request(request_id.clone()), None, None, None)
+                .unwrap();
+            state.claim_server_request(&request_id, None).unwrap();
+        }
+
+        assert!(matches!(
+            state.register_server_request(
+                raw_server_request(RequestId::String("overflow".to_owned())),
+                None,
+                None,
+                None,
+            ),
+            Err(ClientError::CapacityExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_server_request_remains_protocol_violation_at_capacity() {
+        let mut state = ready_state();
+        let duplicate_id = RequestId::String("duplicate".to_owned());
+        state
+            .register_server_request(raw_server_request(duplicate_id.clone()), None, None, None)
+            .unwrap();
+        for index in 1..MAX_PENDING_SERVER_REQUESTS {
+            state
+                .register_server_request(
+                    raw_server_request(RequestId::String(format!("other-{index}"))),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            state.register_server_request(raw_server_request(duplicate_id), None, None, None),
+            Err(ClientError::ProtocolViolation { .. })
+        ));
+    }
+
+    #[test]
     fn resolved_server_request_cannot_be_claimed() {
         let mut state = ready_state();
         let request_id = RequestId::String("resolved".to_owned());
@@ -836,6 +919,41 @@ mod tests {
 
         assert!(matches!(
             state.claim_server_request(&request_id, Some(&ServerRequestResult::new(Value::Null))),
+            Err(ClientError::UnknownServerRequestId { .. })
+        ));
+    }
+
+    #[test]
+    fn turn_completion_removes_stale_server_requests() {
+        let mut state = ready_state();
+        let thread_id = ThreadId::new("thread");
+        let turn_id = TurnId::new("turn");
+        let _waiter = state.begin_turn(thread_id.clone()).unwrap();
+        state.bind_turn_id(turn_id.clone()).unwrap();
+        let request_id = RequestId::String("stale".to_owned());
+        state
+            .register_server_request(
+                raw_server_request(request_id.clone()),
+                None,
+                Some(thread_id.clone()),
+                Some(turn_id.clone()),
+            )
+            .unwrap();
+
+        let outcome = TurnOutcome {
+            thread_id,
+            turn_id: turn_id.clone(),
+            turn: serde_json::from_value(json!({
+                "id": turn_id.as_str(),
+                "items": [],
+                "status": "completed"
+            }))
+            .unwrap(),
+        };
+        state.receive_turn_completion(outcome).unwrap().unwrap();
+
+        assert!(matches!(
+            state.claim_server_request(&request_id, None),
             Err(ClientError::UnknownServerRequestId { .. })
         ));
     }

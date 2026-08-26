@@ -5,7 +5,7 @@
 //! unknown client response ID は protocol desynchronization として拒否する。
 
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::{
     ClientError,
@@ -61,11 +61,13 @@ impl Shared {
             self.lock_state().rollback_server_request_claim(&request_id);
             return Err(error);
         }
+        self.lock_state()
+            .complete_server_request_response(&request_id);
         Ok(())
     }
 
     /// 一つの incoming JSON value を envelope 種別に分類し、対応する state transition へ route する。
-    pub(crate) fn dispatch(&self, value: Value) -> Result<(), ClientError> {
+    pub(crate) async fn dispatch(&self, value: Value) -> Result<(), ClientError> {
         match classify_message(value)? {
             IncomingMessage::Success { id, result } => self.route_response(id, Ok(result)),
             IncomingMessage::Error { id, error } => self.route_rpc_error(id, error),
@@ -74,7 +76,7 @@ impl Shared {
                 method,
                 params,
                 raw,
-            } => self.route_server_request(id, method, params, raw),
+            } => self.route_server_request(id, method, params, raw).await,
             IncomingMessage::Notification {
                 method,
                 params,
@@ -250,7 +252,7 @@ impl Shared {
     /// app-server からの request を validation、classification、pending registration 後に event として公開する。
     ///
     /// registration を event 配信より先に行うことで、event consumer が直ちに response API を呼んでも request が必ず存在する。
-    fn route_server_request(
+    async fn route_server_request(
         &self,
         id: RequestId,
         method: String,
@@ -279,12 +281,29 @@ impl Shared {
             params,
             raw,
         };
-        self.lock_state().register_server_request(
-            request.clone(),
-            typed_kind,
-            thread_id,
-            turn_id,
-        )?;
+        let registration = {
+            self.lock_state().register_server_request(
+                request.clone(),
+                typed_kind,
+                thread_id,
+                turn_id,
+            )
+        };
+        match registration {
+            Ok(()) => {}
+            Err(error @ ClientError::CapacityExceeded { .. }) => {
+                self.send_value(
+                    json!({
+                        "id": request.id,
+                        "error": {"code": -32000, "message": error.to_string()}
+                    }),
+                    true,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         self.publish_event(Event::ServerRequest(request));
         Ok(())
     }
@@ -333,7 +352,38 @@ fn client_response_id(id: RequestId) -> Result<i64, ClientError> {
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::{broadcast, mpsc, watch};
+
     use super::*;
+    use crate::{state::ClientState, transport::Outgoing};
+
+    fn ready_shared() -> (Shared, mpsc::Receiver<Outgoing>) {
+        let (outgoing_sender, outgoing_receiver) = mpsc::channel(1);
+        let (event_sender, _) = broadcast::channel(16);
+        let (process_sender, _) = mpsc::channel(1);
+        let (writer_stop, _) = watch::channel(false);
+        let shared = Shared::new(
+            outgoing_sender,
+            event_sender,
+            process_sender,
+            writer_stop,
+            std::time::Duration::from_secs(1),
+        );
+        {
+            let mut state = shared.lock_state();
+            state.begin_initialization();
+            state.finish_initialization().unwrap();
+        }
+        (shared, outgoing_receiver)
+    }
+
+    async fn acknowledge_next_message(receiver: &mut mpsc::Receiver<Outgoing>) -> Value {
+        let Outgoing::Message { value, ack } = receiver.recv().await.unwrap() else {
+            panic!("expected response message");
+        };
+        ack.unwrap().send(Ok(())).unwrap();
+        value
+    }
 
     #[test]
     fn classifies_typed_known_and_unknown_server_requests() {
@@ -359,5 +409,74 @@ mod tests {
             classify_server_request("future/request", false),
             (ServerRequestKind::Unsupported, None)
         );
+    }
+
+    #[tokio::test]
+    async fn successful_server_request_response_removes_tracking_entry() {
+        let (shared, mut outgoing_receiver) = ready_shared();
+        let request_id = RequestId::String("completed".to_owned());
+        shared
+            .dispatch(json!({
+                "id": request_id.clone(),
+                "method": "future/request",
+                "params": {}
+            }))
+            .await
+            .unwrap();
+        shared.claim_server_request(&request_id, None).unwrap();
+
+        let (send_result, response) = tokio::join!(
+            shared.send_claimed_server_request(
+                request_id.clone(),
+                json!({"id": null, "result": {}}),
+            ),
+            acknowledge_next_message(&mut outgoing_receiver),
+        );
+        send_result.unwrap();
+        assert_eq!(response["id"], json!(request_id));
+        assert!(matches!(
+            shared.claim_server_request(&request_id, None),
+            Err(ClientError::UnknownServerRequestId { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_request_capacity_overflow_is_request_local() {
+        let (shared, mut outgoing_receiver) = ready_shared();
+        let mut events = shared.subscribe();
+        let mut turn_waiter = shared.begin_turn(ThreadId::new("thread")).unwrap();
+        for index in 0..4 {
+            shared
+                .dispatch(json!({
+                    "id": format!("request-{index}"),
+                    "method": "future/request",
+                    "params": {}
+                }))
+                .await
+                .unwrap();
+        }
+        let overflow_id = RequestId::String("overflow".to_owned());
+
+        let (dispatch_result, response) = tokio::join!(
+            shared.dispatch(json!({
+                "id": overflow_id.clone(),
+                "method": "future/request",
+                "params": {}
+            })),
+            acknowledge_next_message(&mut outgoing_receiver),
+        );
+
+        dispatch_result.unwrap();
+        assert_eq!(response["id"], json!(overflow_id));
+        assert!(response["error"].is_object());
+        assert_eq!(shared.state(), ClientState::Ready);
+        assert_eq!(shared.pending_server_requests().len(), 4);
+        assert!(matches!(
+            turn_waiter.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, Event::Failure(_)));
+        }
     }
 }

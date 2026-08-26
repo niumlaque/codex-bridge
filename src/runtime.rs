@@ -317,7 +317,7 @@ impl Shared {
             tokio::spawn(async move {
                 let result = stdout_reader(process.stdout, max_message_bytes, |value| {
                     let inner = stdout_inner.clone();
-                    async move { inner.dispatch(value) }
+                    async move { inner.dispatch(value).await }
                 })
                 .await;
                 match result {
