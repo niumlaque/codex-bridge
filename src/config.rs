@@ -50,6 +50,10 @@ pub struct ClientConfig {
     pub working_directory: PathBuf,
     /// parent process から継承する environment variable の基準 policy。
     pub environment_policy: EnvironmentPolicy,
+    /// app-server の stderr を parent process へ直接継承するか。
+    ///
+    /// `false` の場合は pipe し、`Event::Stderr` として subscriber へ配信する。
+    pub inherit_stderr: bool,
     ///基準 policy の適用後に明示追加する environment variable。
     ///
     /// `CODEX_HOME` は専用 field と競合するため、この map から上書きできない。
@@ -76,6 +80,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("codex_home", &self.codex_home)
             .field("working_directory", &self.working_directory)
             .field("environment_policy", &self.environment_policy)
+            .field("inherit_stderr", &self.inherit_stderr)
             // environment value は token や credential を含み得るため、key だけを diagnostic に残す。
             .field("environment", &self.environment.keys().collect::<Vec<_>>())
             .field("initialize_timeout", &self.initialize_timeout)
@@ -99,6 +104,7 @@ impl ClientConfig {
             codex_home: codex_home.into(),
             working_directory: working_directory.into(),
             environment_policy: EnvironmentPolicy::Inherit,
+            inherit_stderr: false,
             environment: HashMap::new(),
             initialize_timeout: Duration::from_secs(30),
             shutdown_timeout: Duration::from_secs(5),
@@ -227,6 +233,7 @@ mod tests {
         let config = ClientConfig::new(home, cwd);
         assert_eq!(config.executable, PathBuf::from("codex"));
         assert_eq!(config.environment_policy, EnvironmentPolicy::Inherit);
+        assert!(!config.inherit_stderr);
         assert_eq!(config.initialize_timeout, Duration::from_secs(30));
         assert_eq!(config.max_message_bytes, 4 * 1024 * 1024);
         assert_eq!(config.event_queue_capacity, 8);

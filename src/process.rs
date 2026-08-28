@@ -29,8 +29,8 @@ pub(crate) struct SpawnedProcess {
     pub stdin: ChildStdin,
     /// JSONL reader task だけが所有する stdout pipe。
     pub stdout: ChildStdout,
-    /// stderr drain task だけが所有する stderr pipe。
-    pub stderr: ChildStderr,
+    /// stderr を pipe した場合だけ stderr drain task が所有する pipe。
+    pub stderr: Option<ChildStderr>,
 }
 
 /// runtime から process supervisor へ送る lifecycle command。
@@ -48,8 +48,9 @@ pub(crate) enum ProcessCommand {
 
 /// validated config から dedicated process group 内に app-server を起動する。
 ///
-/// pipe の一つでも取得できない場合は partially spawned process を返さず error とする。`kill_on_drop` は setup 中の
-/// early return に対する safety net であり、通常の終了 ownership は process supervisor が持つ。
+/// 必須の stdin/stdout pipe を取得できない場合、または stderr を pipe する設定で stderr pipe を取得できない場合は
+/// partially spawned process を返さず error とする。`kill_on_drop` は setup 中の early return に対する safety net であり、
+///通常の終了 ownership は process supervisor が持つ。
 pub(crate) fn spawn_process(config: &ClientConfig) -> Result<SpawnedProcess, ClientError> {
     let mut command = Command::new(&config.executable);
     if config.environment_policy == EnvironmentPolicy::Clean {
@@ -65,7 +66,11 @@ pub(crate) fn spawn_process(config: &ClientConfig) -> Result<SpawnedProcess, Cli
         .envs(&config.environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(if config.inherit_stderr {
+            Stdio::inherit()
+        } else {
+            Stdio::piped()
+        })
         .kill_on_drop(true);
     let process_group = ProcessGroup::new().map_err(|error| ClientError::SpawnFailed {
         detail: error.to_string(),
@@ -83,10 +88,16 @@ pub(crate) fn spawn_process(config: &ClientConfig) -> Result<SpawnedProcess, Cli
         .stdout
         .take()
         .ok_or(ClientError::MissingPipe { pipe: "stdout" })?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(ClientError::MissingPipe { pipe: "stderr" })?;
+    let stderr = if config.inherit_stderr {
+        None
+    } else {
+        Some(
+            child
+                .stderr
+                .take()
+                .ok_or(ClientError::MissingPipe { pipe: "stderr" })?,
+        )
+    };
     Ok(SpawnedProcess {
         child: SupervisedChild {
             child,

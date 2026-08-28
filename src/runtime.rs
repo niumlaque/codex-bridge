@@ -281,8 +281,8 @@ impl Shared {
 
     /// child pipe と process handle を専用 background task へ分配する。
     ///
-    /// stdin は single writer、stdout は protocol reader、stderr は raw drain、child handle は supervisor がそれぞれ
-    /// exclusive ownership を持つ。各 fatal task error は stopping 中でない場合だけ [`Shared::fail`] へ昇格する。
+    /// stdin は single writer、stdout は protocol reader、pipe された stderr は raw drain、child handle は supervisor が
+    ///それぞれ exclusive ownership を持つ。各 fatal task error は stopping 中でない場合だけ [`Shared::fail`] へ昇格する。
     pub(crate) fn spawn_tasks(
         self: &Arc<Self>,
         process: SpawnedProcess,
@@ -334,17 +334,19 @@ impl Shared {
             }),
         );
 
-        let stderr_events = self.event_sender.clone();
-        self.push_task(
-            "stderr reader",
-            tokio::spawn(async move {
-                // stderr は diagnostic stream であり、drain failure を primary protocol failure には昇格しない。
-                let _ = stderr_reader(process.stderr, |bytes| {
-                    let _ = stderr_events.send(Event::Stderr(bytes));
-                })
-                .await;
-            }),
-        );
+        if let Some(stderr) = process.stderr {
+            let stderr_events = self.event_sender.clone();
+            self.push_task(
+                "stderr reader",
+                tokio::spawn(async move {
+                    // stderr は diagnostic stream であり、drain failure を primary protocol failure には昇格しない。
+                    let _ = stderr_reader(stderr, |bytes| {
+                        let _ = stderr_events.send(Event::Stderr(bytes));
+                    })
+                    .await;
+                }),
+            );
+        }
 
         let weak = Arc::downgrade(self);
         self.push_task(
