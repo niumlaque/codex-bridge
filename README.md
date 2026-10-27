@@ -22,26 +22,15 @@ The crate does not provide multi-process orchestration or concurrent active turn
 
 ## Installation
 
-This crate is currently consumed directly from its private GitHub repository. Pin the dependency to an explicit commit with `rev`:
+This crate is consumed directly from its GitHub repository. Pin the dependency to an explicit commit with `rev`:
 
 ```toml
 [dependencies]
-codex-bridge = { git = "ssh://git@github.com/niumlaque/codex-bridge.git", rev = "<commit-sha>" }
+codex-bridge = { git = "https://github.com/niumlaque/codex-bridge.git", rev = "<commit-sha>" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
 The basic usage example below uses `#[tokio::main]`, so applications using that example need Tokio as a direct dependency. The listed features provide the macro and its default multi-threaded runtime.
-
-The build environment must be able to authenticate to GitHub over SSH and read the private repository.
-
-Cargo normally fetches Git dependencies with its built-in Git implementation. If SSH authentication does not work in the environment, Cargo can instead use the system `git` CLI. Add the following to `.cargo/config.toml` when needed:
-
-```toml
-[net]
-git-fetch-with-cli = true
-```
-
-This setting is not universally required. Use it when the environment relies on Git CLI authentication or Cargo's built-in Git transport cannot authenticate successfully.
 
 ## Usage rules
 
@@ -331,3 +320,9 @@ Useful entry points are:
 - `TurnOutcome`
 
 The README describes how these pieces are intended to be combined. The public API documentation and checked-in source define their exact current shape.
+
+## License
+
+The original code in `codex-bridge` is licensed under the [MIT License](LICENSE).
+
+The bundled JSON Schemas derived from OpenAI Codex are licensed under the [Apache License 2.0](schema/LICENSE). See [schema/README.md](schema/README.md) for schema provenance and license details.
