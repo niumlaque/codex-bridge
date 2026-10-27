@@ -5,7 +5,7 @@ This directory contains JSON Schema definitions for the OpenAI Codex App Server 
 ## Source
 
 - Project: [OpenAI Codex](https://github.com/openai/codex)
-- Codex CLI version: `0.157.0`
+- Codex CLI version: `0.164.0`
 - Protocol: Codex App Server (JSON-RPC)
 
 The schemas were generated from the Codex App Server protocol and are maintained as a versioned snapshot.
