@@ -474,6 +474,14 @@ mod tests {
                 true,
             ),
             (
+                json!({"method": "thread/search/partial", "params": {"requestId": 1, "data": []}}),
+                true,
+            ),
+            (
+                json!({"method": "thread/section/changed", "params": {"threadId": "thread", "sectionId": null}}),
+                true,
+            ),
+            (
                 json!({"method": "future/event", "params": [42], "extra": true}),
                 false,
             ),
