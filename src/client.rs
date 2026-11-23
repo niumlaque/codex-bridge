@@ -9,7 +9,8 @@ use crate::process::{ProcessCommand, spawn_process};
 use crate::protocol::{
     ClientInfo, InitializeParams, InitializeRuntimeResponse, RpcError, ServerRequestId,
     ServerRequestResult, ThreadId, ThreadStartOutcome, ThreadStartParams, ThreadStartResponse,
-    TurnId, TurnOutcome, TurnStartParams, TurnStartResponse, WireObject,
+    ThreadTurnsListParams, ThreadTurnsListResponse, TurnId, TurnOutcome, TurnStartParams,
+    TurnStartResponse, WireObject,
 };
 use crate::runtime::{RequestPermission, Shared};
 use crate::shutdown;
@@ -237,6 +238,20 @@ impl Client {
         })
     }
 
+    /// スレッドの turn 履歴を指定された条件で 1 ページ取得する。
+    ///
+    /// 次のページを取得する場合は、返された `next_cursor` を次回の `params.cursor` に指定する。
+    pub async fn list_thread_turns(
+        &self,
+        params: ThreadTurnsListParams,
+    ) -> Result<ThreadTurnsListResponse, ClientError> {
+        let WireObject(response) = self
+            .inner
+            .send_request("thread/turns/list", &params, RequestPermission::Ready)
+            .await?;
+        Ok(response)
+    }
+
     /// turn を開始し、対応する terminal `turn/completed` notification まで待機する。
     ///
     /// app-server は `turn/start` response より先に terminal notification を送る可能性があるため、runtime state が
@@ -422,6 +437,25 @@ mod tests {
         };
         ack.unwrap().send(Ok(())).unwrap();
         value
+    }
+
+    async fn list_thread_turns_with_response(
+        client: &Client,
+        outgoing: &mut mpsc::Receiver<Outgoing>,
+        params: ThreadTurnsListParams,
+        expected_params: Value,
+        mut response: Value,
+    ) -> Result<ThreadTurnsListResponse, ClientError> {
+        let (result, ()) = tokio::join!(client.list_thread_turns(params), async {
+            let Some(Outgoing::Message { value, ack: None }) = outgoing.recv().await else {
+                panic!("expected thread/turns/list request");
+            };
+            assert_eq!(value["method"], "thread/turns/list");
+            assert_eq!(value["params"], expected_params);
+            response["id"] = value["id"].clone();
+            client.inner.dispatch(response).await.unwrap();
+        });
+        result
     }
 
     #[tokio::test]
@@ -647,6 +681,180 @@ mod tests {
             outgoing.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn list_thread_turns_preserves_raw_turns_and_follows_a_caller_supplied_cursor() {
+        let (client, mut outgoing, _) = ready_client();
+        let params = ThreadTurnsListParams {
+            thread_id: ThreadId::new("saved-thread"),
+            cursor: Some("initial-cursor".to_owned()),
+            limit: Some(2),
+            sort_direction: Some("asc".to_owned()),
+            items_view: Some("full".to_owned()),
+        };
+        let mut expected_params = json!({
+            "threadId": "saved-thread",
+            "cursor": "initial-cursor",
+            "limit": 2,
+            "sortDirection": "asc",
+            "itemsView": "full"
+        });
+        let turns = vec![
+            json!({
+                "id": "turn-z",
+                "status": "completed",
+                "itemsView": "full",
+                "items": [
+                    {
+                        "id": "item-z",
+                        "type": "userMessage",
+                        "clientId": "user-message",
+                        "content": [{"type": "text", "text": "Question"}]
+                    },
+                    {
+                        "id": "item-a",
+                        "type": "agentMessage",
+                        "text": "Answer",
+                        "phase": "final_answer",
+                        "futureField": {"values": [1, null]}
+                    }
+                ],
+                "rootTurnId": "root-turn",
+                "startedAt": 100,
+                "completedAt": 101,
+                "durationMs": 1000
+            }),
+            json!({
+                "id": "turn-a",
+                "status": "futureStatus",
+                "items": [
+                    {"type": "futureItem", "payload": [1, null]},
+                    {"type": "agentMessage", "text": false},
+                    null
+                ],
+                "itemsView": {"future": true},
+                "startedAt": "unknown",
+                "futureField": [null, false]
+            }),
+        ];
+        let page = list_thread_turns_with_response(
+            &client,
+            &mut outgoing,
+            params.clone(),
+            expected_params.clone(),
+            json!({"result": {
+                "data": turns,
+                "nextCursor": "next-cursor",
+                "backwardsCursor": "previous-cursor"
+            }}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.data, turns);
+        assert_eq!(page.next_cursor.as_deref(), Some("next-cursor"));
+
+        expected_params["cursor"] = json!("next-cursor");
+        let last_turn = json!({"id": "turn-b", "status": "completed", "items": []});
+        let last_page = list_thread_turns_with_response(
+            &client,
+            &mut outgoing,
+            ThreadTurnsListParams {
+                cursor: page.next_cursor,
+                ..params
+            },
+            expected_params,
+            json!({"result": {"data": [last_turn], "nextCursor": null}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(last_page.data, vec![last_turn]);
+        assert_eq!(last_page.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_thread_turns_omits_unset_options_and_accepts_a_missing_next_cursor() {
+        let (client, mut outgoing, _) = ready_client();
+        let page = list_thread_turns_with_response(
+            &client,
+            &mut outgoing,
+            ThreadTurnsListParams {
+                thread_id: ThreadId::new("saved-thread"),
+                cursor: None,
+                limit: None,
+                sort_direction: None,
+                items_view: None,
+            },
+            json!({"threadId": "saved-thread"}),
+            json!({"result": {"data": []}}),
+        )
+        .await
+        .unwrap();
+        assert!(page.data.is_empty());
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_thread_turns_uses_existing_rpc_and_response_errors() {
+        let (client, mut outgoing, _) = ready_client();
+        let params = ThreadTurnsListParams {
+            thread_id: ThreadId::new("saved-thread"),
+            cursor: None,
+            limit: None,
+            sort_direction: None,
+            items_view: None,
+        };
+        let expected_params = json!({"threadId": "saved-thread"});
+        let result = list_thread_turns_with_response(
+            &client,
+            &mut outgoing,
+            params.clone(),
+            expected_params.clone(),
+            json!({"error": {"code": -32602, "message": "thread not found"}}),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ClientError::RpcFailed { method, request_id: 1, code: -32602, message })
+                if method == "thread/turns/list" && message == "thread not found"
+        ));
+        assert_eq!(client.state(), ClientState::Ready);
+
+        let private_content = "private turn content";
+        for malformed_result in [
+            json!({"data": {}}),
+            json!({"data": private_content}),
+            json!({"nextCursor": null}),
+            json!({"data": [], "nextCursor": 42}),
+            json!([[], null]),
+            json!({"data": [null]}),
+            json!({"data": [{"status": "completed", "items": []}]}),
+            json!({"data": [{"id": 42, "status": "completed", "items": []}]}),
+            json!({"data": [{"id": "turn", "items": []}]}),
+            json!({"data": [{"id": "turn", "status": false, "items": []}]}),
+            json!({"data": [{"id": "turn", "status": "completed"}]}),
+            json!({"data": [
+                {"id": "valid-turn", "status": "completed", "items": []},
+                {"id": "invalid-turn", "status": "completed", "items": private_content}
+            ]}),
+        ] {
+            let (client, mut outgoing, _) = ready_client();
+            let result = list_thread_turns_with_response(
+                &client,
+                &mut outgoing,
+                params.clone(),
+                expected_params.clone(),
+                json!({"result": malformed_result}),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(ClientError::ProtocolViolation { reason })
+                    if reason.starts_with("invalid thread/turns/list response payload: ")
+                        && !reason.contains(private_content)
+            ));
+            assert_eq!(client.state(), ClientState::Failed);
+        }
     }
 
     #[tokio::test]

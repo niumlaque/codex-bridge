@@ -29,8 +29,9 @@ pub use protocol::{
     ReasoningEffort, ReasoningSummary, RpcError, SandboxMode, SandboxPolicy, ServerRequestId,
     ServerRequestResolvedNotification, ServerRequestResult, SimpleApprovalPolicy, TextElement,
     ThreadActiveFlag, ThreadId, ThreadItem, ThreadStartOutcome, ThreadStartParams,
-    ThreadStartSource, ThreadStatus, ThreadStatusChangedNotification, ToolRequestUserInputAnswer,
-    ToolRequestUserInputResponse, Turn, TurnCompletedNotification, TurnError, TurnId, TurnOutcome,
-    TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
+    ThreadStartSource, ThreadStatus, ThreadStatusChangedNotification, ThreadTurnsListParams,
+    ThreadTurnsListResponse, ToolRequestUserInputAnswer, ToolRequestUserInputResponse, Turn,
+    TurnCompletedNotification, TurnError, TurnId, TurnOutcome, TurnStartParams,
+    TurnStartedNotification, TurnStatus, UserInput,
 };
 pub use state::{ClientState, ShutdownReport};

@@ -38,7 +38,8 @@ pub(crate) use thread::ThreadStartResponse;
 pub use thread::{
     ApprovalsReviewer, AskForApproval, DynamicToolSpec, GranularApprovalPolicy, Personality,
     SandboxMode, SimpleApprovalPolicy, ThreadActiveFlag, ThreadId, ThreadStartOutcome,
-    ThreadStartParams, ThreadStartSource, ThreadStatus,
+    ThreadStartParams, ThreadStartSource, ThreadStatus, ThreadTurnsListParams,
+    ThreadTurnsListResponse,
 };
 pub use turn::{
     AdditionalContextEntry, ByteRange, ImageDetail, NetworkAccess, ReasoningEffort,

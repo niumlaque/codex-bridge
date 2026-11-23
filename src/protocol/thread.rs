@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 use super::turn::{ReasoningEffort, SandboxPolicy};
@@ -242,6 +242,56 @@ pub(crate) struct ThreadStartResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct WireThread {
     pub id: ThreadId,
+}
+
+/// `thread/turns/list` で取得する履歴ページの指定。
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListParams {
+    pub thread_id: ThreadId,
+    /// 前ページの `next_cursor`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// 1 ページに取得する turn 数。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// 履歴を辿る方向。`"asc"` または `"desc"`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<String>,
+    /// turn item の詳細度。`"notLoaded"`、`"summary"`、または `"full"`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items_view: Option<String>,
+}
+
+/// `thread/turns/list` が返した履歴ページ。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsListResponse {
+    /// app-server が返した順序のまま保持した turn の JSON。
+    #[serde(deserialize_with = "deserialize_thread_turns")]
+    pub data: Vec<Value>,
+    /// 次ページを取得するためのカーソル。履歴の末尾では `None`。
+    pub next_cursor: Option<String>,
+}
+
+fn deserialize_thread_turns<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Value>, D::Error> {
+    let Value::Array(turns) = Value::deserialize(deserializer)? else {
+        return Err(serde::de::Error::custom("turn data must be an array"));
+    };
+    for turn in &turns {
+        if !turn.get("id").is_some_and(Value::is_string) {
+            return Err(serde::de::Error::custom("turn id must be a string"));
+        }
+        if !turn.get("status").is_some_and(Value::is_string) {
+            return Err(serde::de::Error::custom("turn status must be a string"));
+        }
+        if !turn.get("items").is_some_and(Value::is_array) {
+            return Err(serde::de::Error::custom("turn items must be an array"));
+        }
+    }
+    Ok(turns)
 }
 
 /// app-server thread の current activity state。
