@@ -209,6 +209,34 @@ impl Client {
         })
     }
 
+    /// 既存の app-server thread を再開し、再開時の実効設定を返す。
+    ///
+    /// 履歴はレスポンスから省略される。再開した thread の会話コンテキストは
+    /// 返された thread ID を指定する後続の [`Client::run_turn`] で引き継がれる。
+    pub async fn resume_thread(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<ThreadStartOutcome, ClientError> {
+        let WireObject(response): WireObject<ThreadStartResponse> = self
+            .inner
+            .send_request(
+                "thread/resume",
+                &json!({"threadId": thread_id, "excludeTurns": true}),
+                RequestPermission::Ready,
+            )
+            .await?;
+        Ok(ThreadStartOutcome {
+            thread_id: response.thread.id,
+            model: response.model,
+            reasoning_effort: response.reasoning_effort,
+            approval_policy: response.approval_policy,
+            approvals_reviewer: response.approvals_reviewer,
+            sandbox: response.sandbox,
+            cwd: response.cwd,
+            model_provider: response.model_provider,
+        })
+    }
+
     /// turn を開始し、対応する terminal `turn/completed` notification まで待機する。
     ///
     /// app-server は `turn/start` response より先に terminal notification を送る可能性があるため、runtime state が
@@ -333,7 +361,10 @@ struct EmptyResponse {}
 
 #[cfg(test)]
 mod tests {
-    use crate::{event::ServerRequestKind, protocol::RequestId, transport::Outgoing};
+    use crate::{
+        ApprovalsReviewer, AskForApproval, SandboxPolicy, SimpleApprovalPolicy, TurnStatus,
+        UserInput, event::ServerRequestKind, protocol::RequestId, transport::Outgoing,
+    };
 
     use super::*;
 
@@ -493,6 +524,129 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn resume_thread_returns_effective_settings_and_can_run_a_turn() {
+        let (client, mut outgoing, _) = ready_client();
+        let (thread, ()) = tokio::join!(client.resume_thread(ThreadId::new("existing")), async {
+            let Some(Outgoing::Message { value, ack: None }) = outgoing.recv().await else {
+                panic!("expected thread/resume request");
+            };
+            assert_eq!(value["method"], "thread/resume");
+            assert_eq!(
+                value["params"],
+                json!({"threadId": "existing", "excludeTurns": true})
+            );
+            let result = json!({
+                "thread": {"id": "existing", "turns": []},
+                "model": "resumed-model",
+                "reasoningEffort": "high",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
+                "sandbox": {"type": "readOnly", "networkAccess": false},
+                "cwd": "/resumed-workspace",
+                "modelProvider": "resumed-provider"
+            });
+            client
+                .inner
+                .dispatch(json!({"id": value["id"], "result": result}))
+                .await
+                .unwrap();
+        });
+        let thread = thread.unwrap();
+        assert_eq!(thread.thread_id.as_str(), "existing");
+        assert_eq!(thread.model, "resumed-model");
+        assert_eq!(thread.reasoning_effort.unwrap().as_str(), "high");
+        assert!(matches!(
+            thread.approval_policy,
+            AskForApproval::Simple(SimpleApprovalPolicy::OnRequest)
+        ));
+        assert!(matches!(thread.approvals_reviewer, ApprovalsReviewer::User));
+        assert!(matches!(
+            thread.sandbox,
+            SandboxPolicy::ReadOnly {
+                network_access: Some(false)
+            }
+        ));
+        assert_eq!(thread.cwd, "/resumed-workspace");
+        assert_eq!(thread.model_provider, "resumed-provider");
+
+        let turn = TurnStartParams::new(
+            thread.thread_id,
+            vec![UserInput::Text {
+                text: "Continue the conversation.".to_owned(),
+                text_elements: Vec::new(),
+            }],
+        );
+        let (outcome, ()) = tokio::join!(client.run_turn(turn), async {
+            let Some(Outgoing::Message { value, ack: None }) = outgoing.recv().await else {
+                panic!("expected turn/start request");
+            };
+            assert_eq!(value["method"], "turn/start");
+            assert_eq!(value["params"]["threadId"], "existing");
+            client
+                .inner
+                .dispatch(json!({"id": value["id"], "result": {"turn": {"id": "turn"}}}))
+                .await
+                .unwrap();
+            client
+                .inner
+                .dispatch(json!({"method": "turn/completed", "params": {
+                    "threadId": "existing",
+                    "turn": {"id": "turn", "status": "completed", "items": []}
+                }}))
+                .await
+                .unwrap();
+        });
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.thread_id.as_str(), "existing");
+        assert_eq!(outcome.turn_id.as_str(), "turn");
+        assert_eq!(outcome.turn.status, TurnStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn resume_thread_propagates_rpc_errors_without_sending_another_request() {
+        let (client, mut outgoing, _) = ready_client();
+        let mut resume = std::pin::pin!(client.resume_thread(ThreadId::new("missing")));
+        let request = tokio::select! {
+            message = outgoing.recv() => message,
+            result = &mut resume => panic!("resume returned before sending a request: {result:?}"),
+        };
+        let Some(Outgoing::Message { value, ack: None }) = request else {
+            panic!("expected thread/resume request");
+        };
+        assert_eq!(value["method"], "thread/resume");
+        client
+            .inner
+            .dispatch(json!({
+                "id": value["id"],
+                "error": {"code": -32602, "message": "thread not found"}
+            }))
+            .await
+            .unwrap();
+
+        let error = tokio::select! {
+            result = &mut resume => result.unwrap_err(),
+            _ = outgoing.recv() => panic!("resume sent another request after the RPC error"),
+        };
+        let ClientError::RpcFailed {
+            method,
+            request_id,
+            code,
+            message,
+        } = error
+        else {
+            panic!("expected a JSON-RPC failure: {error:?}");
+        };
+        assert_eq!(method, "thread/resume");
+        assert_eq!(request_id, value["id"].as_i64().unwrap());
+        assert_eq!(code, -32602);
+        assert_eq!(message, "thread not found");
+        assert!(matches!(
+            outgoing.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

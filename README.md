@@ -9,7 +9,7 @@ This README is written primarily for LLMs and code-generation agents that need t
 Use this crate when an application needs to:
 
 - start and initialize one `codex app-server` child process;
-- create app-server threads;
+- create or resume app-server threads
 - run one active turn at a time;
 - receive asynchronous app-server events;
 - respond to app-server `ServerRequest`s;
@@ -39,7 +39,7 @@ Follow these rules when generating code that uses this crate.
 1. Create configuration with `ClientConfig::new`.
 2. Start the app-server with `Client::spawn`. A successful return means the initialize handshake has completed.
 3. If asynchronous events matter, call `Client::subscribe` before starting work that may emit those events. Event subscription does not replay earlier events.
-4. Create a thread with `Client::start_thread` before starting a turn.
+4. Before starting a turn, create a new thread with `Client::start_thread` or resume an existing thread with `Client::resume_thread`.
 5. Start a turn with `Client::run_turn`. Only one active turn may exist across all clones of the same `Client`.
 6. Treat `Event::ServerRequest` as a request that requires caller-side handling. The crate does not choose approval decisions or user-input answers for the caller.
 7. Use the response type that matches the received `ServerRequestKind`. Do not fabricate raw responses for typed approval or user-input requests.
@@ -73,7 +73,7 @@ For the common request/response path, use this order:
 2. optional configuration overrides
 3. `Client::spawn(config).await`
 4. `client.subscribe()` if events must be observed
-5. `client.start_thread(...)`
+5. `client.start_thread(...)` for a new thread or `client.resume_thread(thread_id)` for an existing thread
 6. `client.run_turn(...)`
 7. handle the returned terminal `TurnOutcome`
 8. `client.shutdown().await`
@@ -133,7 +133,7 @@ The default configuration:
 
 ### Threads
 
-Create a thread with:
+Create a new thread with `start_thread`.
 
 ```rust
 let thread = client.start_thread(ThreadStartParams::default()).await?;
@@ -142,6 +142,14 @@ let thread = client.start_thread(ThreadStartParams::default()).await?;
 `ThreadStartParams` contains optional overrides. A `None` field is omitted from the request so the app-server configuration/default remains in effect.
 
 `start_thread` returns `ThreadStartOutcome`, including the new `thread_id` and the effective initial settings returned by the app-server.
+
+Resume a saved thread with its ID.
+
+```rust
+let thread = client.resume_thread(codex_bridge::ThreadId::new(saved_thread_id)).await?;
+```
+
+`resume_thread` returns `ThreadStartOutcome` with the resumed thread ID and its effective settings. It sets `excludeTurns: true` to omit turn history from the response. The app-server still restores the conversation context. Pass the returned `thread.thread_id` to `TurnStartParams::new` and call `Client::run_turn` to continue the conversation.
 
 ### Turns
 
