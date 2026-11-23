@@ -7,9 +7,9 @@
 use crate::event::{EventReceiver, ServerRequest};
 use crate::process::{ProcessCommand, spawn_process};
 use crate::protocol::{
-    ClientInfo, InitializeParams, InitializeResponse, RpcError, ServerRequestId,
+    ClientInfo, InitializeParams, InitializeRuntimeResponse, RpcError, ServerRequestId,
     ServerRequestResult, ThreadId, ThreadStartOutcome, ThreadStartParams, ThreadStartResponse,
-    TurnId, TurnOutcome, TurnStartParams, TurnStartResponse,
+    TurnId, TurnOutcome, TurnStartParams, TurnStartResponse, WireObject,
 };
 use crate::runtime::{RequestPermission, Shared};
 use crate::shutdown;
@@ -128,7 +128,7 @@ impl Client {
         };
         let initialize_deadline = Instant::now() + client.config.initialize_timeout;
         let initialize_result = timeout_at(initialize_deadline, async {
-            let response: InitializeResponse = inner
+            let WireObject(response): WireObject<InitializeRuntimeResponse> = inner
                 .send_request("initialize", &initialize, RequestPermission::Initializing)
                 .await?;
             // app-server が client request を受理できるのは initialized notification の write 成功後とする。
@@ -193,7 +193,7 @@ impl Client {
         &self,
         params: ThreadStartParams,
     ) -> Result<ThreadStartOutcome, ClientError> {
-        let response: ThreadStartResponse = self
+        let WireObject(response): WireObject<ThreadStartResponse> = self
             .inner
             .send_request("thread/start", &params, RequestPermission::Ready)
             .await?;
@@ -218,7 +218,11 @@ impl Client {
         let waiter_receiver = self.inner.begin_turn(params.thread_id.clone())?;
         let response = self
             .inner
-            .send_request::<_, TurnStartResponse>("turn/start", &params, RequestPermission::Ready)
+            .send_request::<_, WireObject<TurnStartResponse>>(
+                "turn/start",
+                &params,
+                RequestPermission::Ready,
+            )
             .await;
         if let Err(error) = response {
             self.inner.clear_active_turn_with_error(error.clone());
@@ -387,6 +391,141 @@ mod tests {
         };
         ack.unwrap().send(Ok(())).unwrap();
         value
+    }
+
+    #[tokio::test]
+    async fn initialize_response_requires_only_string_codex_home() {
+        for (result, accepted) in [
+            (json!({"codexHome": "/codex"}), true),
+            (
+                json!({"codexHome": "/codex", "platformOs": 42, "userAgent": false}),
+                true,
+            ),
+            (json!({}), false),
+            (json!({"codexHome": 42}), false),
+            (json!(["/codex"]), false),
+        ] {
+            let (client, mut outgoing, _) = ready_client();
+            client.inner.lock_state().begin_initialization();
+            let (response, ()) = tokio::join!(
+                client
+                    .inner
+                    .send_request::<_, WireObject<InitializeRuntimeResponse>>(
+                        "initialize",
+                        &(),
+                        RequestPermission::Initializing
+                    ),
+                async {
+                    let Some(Outgoing::Message { value, ack: None }) = outgoing.recv().await else {
+                        panic!("expected initialize request");
+                    };
+                    assert_eq!(value["method"], "initialize");
+                    client
+                        .inner
+                        .dispatch(json!({"id": value["id"], "result": result}))
+                        .await
+                        .unwrap();
+                }
+            );
+            if accepted {
+                assert_eq!(response.unwrap().0.codex_home, "/codex");
+            } else {
+                assert!(matches!(
+                    response,
+                    Err(ClientError::ProtocolViolation { .. })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_thread_only_requires_the_id_and_effective_settings() {
+        let valid_result = json!({
+            "thread": {"id": "thread"},
+            "model": "model",
+            "modelProvider": "provider",
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "sandbox": {"type": "readOnly"},
+            "cwd": "/workspace"
+        });
+        let mut extended_result = valid_result.clone();
+        extended_result["thread"]["turns"] = 42.into();
+        let mut invalid_id = valid_result.clone();
+        invalid_id["thread"]["id"] = 42.into();
+        let mut invalid_settings = valid_result.clone();
+        invalid_settings["sandbox"]["networkAccess"] = "true".into();
+        let mut positional_sandbox = valid_result.clone();
+        positional_sandbox["sandbox"] = json!(["dangerFullAccess"]);
+        let mut missing_id = valid_result.clone();
+        missing_id["thread"] = json!({});
+        for (result, accepted) in [
+            (valid_result, true),
+            (extended_result, true),
+            (invalid_id, false),
+            (invalid_settings, false),
+            (positional_sandbox, false),
+            (missing_id, false),
+        ] {
+            let (client, mut outgoing, _) = ready_client();
+            let (outcome, ()) =
+                tokio::join!(client.start_thread(ThreadStartParams::default()), async {
+                    let Some(Outgoing::Message { value, ack: None }) = outgoing.recv().await else {
+                        panic!("expected thread/start request");
+                    };
+                    assert_eq!(value["method"], "thread/start");
+                    client
+                        .inner
+                        .dispatch(json!({"id": value["id"], "result": result}))
+                        .await
+                        .unwrap();
+                });
+            if accepted {
+                let outcome = outcome.unwrap();
+                assert_eq!(outcome.thread_id.as_str(), "thread");
+                assert_eq!(outcome.model, "model");
+                assert_eq!(outcome.model_provider, "provider");
+                assert_eq!(outcome.cwd, "/workspace");
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Err(ClientError::ProtocolViolation { .. })
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_uses_the_response_id_and_delivers_early_completion() {
+        let (client, mut outgoing, _) = ready_client();
+        let (outcome, ()) = tokio::join!(
+            client.run_turn(TurnStartParams::new(crate::ThreadId::new("thread"), vec![])),
+            async {
+                let Some(Outgoing::Message { value, ack: None }) = outgoing.recv().await else {
+                    panic!("expected turn/start request");
+                };
+                assert_eq!(value["method"], "turn/start");
+                for notification in [
+                    json!({"method": "item/completed", "params": {
+                        "threadId": "thread", "turnId": "turn", "completedAtMs": 1,
+                        "item": {"id": "item", "type": "agentMessage", "text": "final", "phase": 42}
+                    }}),
+                    json!({"method": "turn/completed", "params": {
+                        "threadId": "thread", "turn": {"id": "turn", "status": "completed", "items": []}
+                    }}),
+                ] {
+                    client.inner.dispatch(notification).await.unwrap();
+                }
+                client
+                    .inner
+                    .dispatch(json!({"id": value["id"], "result": {"turn": {"id": "turn"}}}))
+                    .await
+                    .unwrap();
+            }
+        );
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.turn_id.as_str(), "turn");
+        assert_eq!(outcome.final_agent_message(), Some("final"));
     }
 
     #[tokio::test]

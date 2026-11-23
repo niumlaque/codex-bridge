@@ -56,3 +56,10 @@ pub struct InitializeResponse {
     /// app-server が外部 request に使用する user agent。
     pub user_agent: String,
 }
+
+/// initialize の handshake で使用する実効設定。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InitializeRuntimeResponse {
+    pub codex_home: String,
+}

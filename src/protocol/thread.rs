@@ -1,14 +1,14 @@
 //! app-server thread の開始 parameter、identity、approval policy、runtime status を定義する。
 //!
-//! public request 型は caller が指定する optional override だけを保持する。thread/start response の完全な wire model は
-//! internal 型として deserialize し、public API では thread ID と初期実効設定だけを返す。
+//! public request 型は caller が指定する optional override だけを保持する。thread/start response から
+//! thread ID と初期実効設定を deserialize し、public API で返す。
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::turn::{ReasoningEffort, SandboxPolicy, Turn};
+use super::turn::{ReasoningEffort, SandboxPolicy};
 
 /// app-server が thread ごとに発行する stable identifier。
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -222,13 +222,11 @@ pub struct ThreadStartOutcome {
     pub model_provider: String,
 }
 
-/// thread/start response の完全な wire model。
-///
-/// public APIは要求された初期実効設定だけを返すが、response全体をdeserializeしてSchema driftを検出する。
-#[allow(dead_code)]
+/// thread/start response から公開する thread ID と初期実効設定。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ThreadStartResponse {
+    #[serde(deserialize_with = "super::deserialize_object")]
     pub sandbox: SandboxPolicy,
     pub approval_policy: AskForApproval,
     pub approvals_reviewer: ApprovalsReviewer,
@@ -236,52 +234,14 @@ pub(crate) struct ThreadStartResponse {
     pub model: String,
     pub model_provider: String,
     pub reasoning_effort: Option<ReasoningEffort>,
+    #[serde(deserialize_with = "super::deserialize_object")]
     pub thread: WireThread,
 }
 
-/// thread/start response に埋め込まれた thread snapshot。
-#[allow(dead_code)]
+/// thread/start response に埋め込まれた thread の識別情報。
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(crate) struct WireThread {
-    pub cli_version: String,
-    pub created_at: i64,
-    pub cwd: String,
-    pub ephemeral: bool,
     pub id: ThreadId,
-    pub model_provider: String,
-    pub preview: String,
-    pub session_id: String,
-    pub source: SessionSource,
-    pub status: ThreadStatus,
-    pub turns: Vec<Turn>,
-    pub updated_at: i64,
-}
-
-/// app-server が返す session source の wire representation。
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub(crate) enum SessionSource {
-    Simple(SessionSourceKind),
-    Custom {
-        custom: String,
-    },
-    SubAgent {
-        #[serde(rename = "subAgent")]
-        sub_agent: Value,
-    },
-}
-
-///既知の simple session source。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) enum SessionSourceKind {
-    Cli,
-    Vscode,
-    Exec,
-    AppServer,
-    Unknown,
 }
 
 /// app-server thread の current activity state。

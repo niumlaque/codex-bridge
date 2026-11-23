@@ -1,8 +1,7 @@
 //! deserialize 済み JSON value を response、notification、ServerRequest へ route する dispatcher。
 //!
-//! envelope classification、checked-in Schema validation、request ID correlation、turn lifecycle correlation をこの layer で
-//! 順番に適用する。未知 notification/request は forward compatibility のため保持するが、既知 method の malformed payload や
-//! unknown client response ID は protocol desynchronization として拒否する。
+//! envelope を分類し、使用する payload field と request ID・turn lifecycle の整合性を検証する。
+//! Generic / Unknown Notification と ServerRequest は raw JSON を保持する。
 
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -16,8 +15,8 @@ use crate::{
         ServerRequestResolvedNotification, ServerRequestResult, ThreadId,
         ThreadStatusChangedNotification, TurnCompletedNotification, TurnCompletedParams, TurnId,
         TurnOutcome, TurnStartResponse, TurnStartedNotification, TypedServerRequestKind,
-        classify_message, is_known_server_notification_method, is_known_server_request_method,
-        typed_server_request_kind, validate_server_notification, validate_server_request,
+        WireObject, classify_message, is_known_server_notification_method,
+        is_known_server_request_method, typed_server_request_kind, validate_permission_profile,
     },
     runtime::Shared,
     state::PendingResponse,
@@ -107,7 +106,7 @@ impl Shared {
         if pending.method() == "turn/start"
             && let Ok(value) = &result
         {
-            let response: TurnStartResponse =
+            let WireObject(response): WireObject<TurnStartResponse> =
                 serde_json::from_value(value.clone()).map_err(|error| {
                     ClientError::ProtocolViolation {
                         reason: format!("invalid turn/start response: {error}"),
@@ -156,20 +155,15 @@ impl Shared {
         Ok(())
     }
 
-    /// notification を Schema validation、typed conversion、state update の順に処理して event を公開する。
+    /// notification を typed conversion と state update の後に event として公開する。
     ///
-    /// checked-in Schema で既知の method は payload 全体を validation する。未知 method は raw event として保持し、
-    /// protocol extension だけを理由に client process を停止しない。
+    /// 専用型を持たない method は checked-in Schema を使って分類し、raw event として保持する。
     fn route_notification(
         &self,
         method: String,
         params: Value,
         raw: Value,
     ) -> Result<(), ClientError> {
-        let schema_known = is_known_server_notification_method(&method);
-        if schema_known {
-            validate_server_notification(&raw)?;
-        }
         let event = match method.as_str() {
             "turn/completed" => {
                 let completed =
@@ -214,11 +208,13 @@ impl Shared {
                     .resolve_server_request(&resolved.request_id);
                 Event::ServerRequestResolved(resolved)
             }
-            _ if schema_known => Event::GenericNotification(RawNotification {
-                method,
-                params,
-                raw,
-            }),
+            _ if is_known_server_notification_method(&method) => {
+                Event::GenericNotification(RawNotification {
+                    method,
+                    params,
+                    raw,
+                })
+            }
             _ => Event::UnknownNotification(RawNotification {
                 method,
                 params,
@@ -259,21 +255,43 @@ impl Shared {
         params: Value,
         raw: Value,
     ) -> Result<(), ClientError> {
-        let schema_known = is_known_server_request_method(&method);
-        if schema_known {
-            validate_server_request(&raw)?;
-        }
-        let (kind, typed_kind) = classify_server_request(&method, schema_known);
-        let object = params.as_object();
+        let (kind, typed_kind) =
+            classify_server_request(&method, is_known_server_request_method(&method));
         // correlation metadata は shutdown cleanup と turn 完了時の stale request 除去に使用する。
-        let thread_id = object
-            .and_then(|value| value.get("threadId"))
-            .and_then(Value::as_str)
-            .map(ThreadId::new);
-        let turn_id = object
-            .and_then(|value| value.get("turnId"))
-            .and_then(Value::as_str)
-            .map(TurnId::new);
+        let (thread_id, turn_id) = if kind == ServerRequestKind::Unsupported {
+            (
+                params.get("threadId").and_then(Value::as_str),
+                params.get("turnId").and_then(Value::as_str),
+            )
+        } else {
+            let requires_turn = typed_kind.is_some() || method == "item/tool/call";
+            let is_elicitation = method == "mcpServer/elicitation/request";
+            (
+                server_request_context_id(
+                    &params,
+                    "threadId",
+                    requires_turn || is_elicitation,
+                    false,
+                )?,
+                // MCP elicitation は active turn に紐づかない場合だけ turnId を省略または null にできる。
+                server_request_context_id(&params, "turnId", requires_turn, is_elicitation)?,
+            )
+        };
+        let thread_id = thread_id.map(ThreadId::new);
+        let turn_id = turn_id.map(TurnId::new);
+        if typed_kind == Some(TypedServerRequestKind::PermissionApproval) {
+            let permissions =
+                params
+                    .get("permissions")
+                    .ok_or_else(|| ClientError::ProtocolViolation {
+                        reason: "permission approval is missing permissions".to_owned(),
+                    })?;
+            validate_permission_profile(permissions).map_err(|reason| {
+                ClientError::ProtocolViolation {
+                    reason: format!("invalid permission approval profile: {reason}"),
+                }
+            })?;
+        }
         let request = ServerRequest {
             id,
             method,
@@ -309,6 +327,22 @@ impl Shared {
     }
 }
 
+fn server_request_context_id<'a>(
+    params: &'a Value,
+    field: &str,
+    required: bool,
+    nullable: bool,
+) -> Result<Option<&'a str>, ClientError> {
+    match params.get(field) {
+        None if !required => Ok(None),
+        Some(Value::Null) if nullable => Ok(None),
+        Some(Value::String(id)) => Ok(Some(id)),
+        _ => Err(ClientError::ProtocolViolation {
+            reason: format!("ServerRequest {field} must be a string"),
+        }),
+    }
+}
+
 /// method を public classification と typed-result validation kind へ変換する。
 fn classify_server_request(
     method: &str,
@@ -335,9 +369,11 @@ fn deserialize_protocol<T: DeserializeOwned>(
     value: &Value,
     operation: &str,
 ) -> Result<T, ClientError> {
-    serde_json::from_value(value.clone()).map_err(|error| ClientError::ProtocolViolation {
-        reason: format!("invalid {operation} payload: {error}"),
-    })
+    let WireObject(payload) =
+        serde::Deserialize::deserialize(value).map_err(|error| ClientError::ProtocolViolation {
+            reason: format!("invalid {operation} payload: {error}"),
+        })?;
+    Ok(payload)
 }
 
 /// client が発行した response ID の domain を positive integer に制限する。
@@ -409,6 +445,286 @@ mod tests {
             classify_server_request("future/request", false),
             (ServerRequestKind::Unsupported, None)
         );
+    }
+
+    #[tokio::test]
+    async fn notifications_validate_typed_fields_and_preserve_raw_events() {
+        let (shared, _) = ready_shared();
+        let mut events = shared.subscribe();
+        let started = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread",
+                "turn": {
+                    "id": "turn", "status": "inProgress", "items": [],
+                    "itemsView": {"future": true}, "rootTurnId": 42
+                },
+                "extra": true
+            }
+        });
+        shared.dispatch(started.clone()).await.unwrap();
+        let Event::TurnStarted(event) = events.recv().await.unwrap() else {
+            panic!("expected typed notification");
+        };
+        assert_eq!(event.turn.id.as_str(), "turn");
+
+        for (raw, known) in [
+            (
+                json!({"method": "thread/deleted", "params": {"threadId": 42}, "extra": true}),
+                true,
+            ),
+            (
+                json!({"method": "future/event", "params": [42], "extra": true}),
+                false,
+            ),
+        ] {
+            shared.dispatch(raw.clone()).await.unwrap();
+            let event = match (events.recv().await.unwrap(), known) {
+                (Event::GenericNotification(event), true)
+                | (Event::UnknownNotification(event), false) => event,
+                _ => panic!("unexpected raw notification classification"),
+            };
+            assert_eq!(event.method, raw["method"]);
+            assert_eq!(event.params, raw["params"]);
+            assert_eq!(event.raw, raw);
+        }
+
+        for (turn, detail) in [
+            (
+                json!({"id": 42, "status": "inProgress", "items": []}),
+                "invalid type: integer `42`, expected a string",
+            ),
+            (
+                json!({"id": "turn", "status": "future", "items": []}),
+                "unknown variant `future`",
+            ),
+            (
+                json!({"id": "turn", "status": "inProgress"}),
+                "missing field `items`",
+            ),
+            (
+                json!(["turn", [], "inProgress", null, null, null, null]),
+                "expected a map",
+            ),
+            (
+                json!({"id": "turn", "status": "failed", "items": [], "error": ["msg", null, null]}),
+                "expected a map",
+            ),
+        ] {
+            let mut raw = started.clone();
+            raw["params"]["turn"] = turn;
+            let Err(ClientError::ProtocolViolation { reason }) = shared.dispatch(raw).await else {
+                panic!("expected ProtocolViolation");
+            };
+            assert!(
+                reason.starts_with("invalid turn/started payload: "),
+                "{reason}"
+            );
+            assert!(reason.contains(detail), "{reason}");
+        }
+        assert!(matches!(
+            shared
+                .dispatch(json!({
+                    "method": "thread/status/changed",
+                    "params": {"threadId": "thread", "status": ["idle"]}
+                }))
+                .await,
+            Err(ClientError::ProtocolViolation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn server_requests_preserve_raw_payloads_and_result_kind_checks() {
+        let (shared, _) = ready_shared();
+        let mut events = shared.subscribe();
+        for (method, params, kind) in [
+            (
+                "item/tool/requestUserInput",
+                json!({"threadId": "thread", "turnId": "turn", "questions": 42}),
+                ServerRequestKind::UserInput,
+            ),
+            (
+                "item/permissions/requestApproval",
+                json!({"threadId": "thread", "turnId": "turn", "permissions": {"network": {"enabled": true}}, "cwd": false}),
+                ServerRequestKind::PermissionApproval,
+            ),
+            (
+                "mcpServer/elicitation/request",
+                json!({"threadId": "thread", "turnId": null, "requestedSchema": {"properties": {}}}),
+                ServerRequestKind::Known,
+            ),
+            (
+                "future/request",
+                json!([42]),
+                ServerRequestKind::Unsupported,
+            ),
+        ] {
+            let raw = json!({"id": method, "method": method, "params": params, "extra": true});
+            shared.dispatch(raw.clone()).await.unwrap();
+            let Event::ServerRequest(request) = events.recv().await.unwrap() else {
+                panic!("expected ServerRequest");
+            };
+            assert_eq!(request.kind, kind);
+            assert_eq!(request.method, method);
+            assert_eq!(request.params, raw["params"]);
+            assert_eq!(request.raw, raw);
+            if matches!(
+                kind,
+                ServerRequestKind::UserInput | ServerRequestKind::PermissionApproval
+            ) {
+                assert!(matches!(
+                    shared.claim_server_request(
+                        &request.id,
+                        Some(&ServerRequestResult::new(json!({})))
+                    ),
+                    Err(ClientError::InvalidServerRequestResult { .. })
+                ));
+            }
+        }
+        assert_eq!(shared.pending_server_requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn unknown_server_requests_only_use_string_correlation_ids() {
+        let (shared, _) = ready_shared();
+        let mut events = shared.subscribe();
+        let turn_waiter = shared.begin_turn(ThreadId::new("thread")).unwrap();
+        shared.bind_turn_id(TurnId::new("turn")).unwrap();
+
+        for (id, params) in [
+            ("bad-thread", json!({"threadId": false, "turnId": "turn"})),
+            (
+                "bad-turn",
+                json!({"threadId": "thread", "turnId": ["turn"]}),
+            ),
+            ("matching", json!({"threadId": "thread", "turnId": "turn"})),
+        ] {
+            let raw = json!({"id": id, "method": "future/request", "params": params});
+            shared.dispatch(raw.clone()).await.unwrap();
+            let Event::ServerRequest(request) = events.try_recv().unwrap() else {
+                panic!("expected ServerRequest");
+            };
+            assert_eq!(request.kind, ServerRequestKind::Unsupported);
+            assert_eq!(request.params, params);
+            assert_eq!(request.raw, raw);
+        }
+        assert_eq!(shared.pending_server_requests().len(), 3);
+
+        shared
+            .dispatch(json!({"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "turn", "items": [], "status": "completed"}
+            }}))
+            .await
+            .unwrap();
+        turn_waiter.await.unwrap().unwrap();
+        let mut pending: Vec<_> = shared
+            .pending_server_requests()
+            .into_iter()
+            .map(|request| request.id.to_string())
+            .collect();
+        pending.sort();
+        assert_eq!(pending, ["bad-thread", "bad-turn"]);
+    }
+
+    #[tokio::test]
+    async fn server_requests_reject_invalid_correlation_fields_and_permissions() {
+        let (shared, _) = ready_shared();
+        for (method, params) in [
+            (
+                "item/commandExecution/requestApproval",
+                json!({"turnId": "turn"}),
+            ),
+            (
+                "item/fileChange/requestApproval",
+                json!({"threadId": "thread"}),
+            ),
+            (
+                "item/tool/requestUserInput",
+                json!({"threadId": 42, "turnId": "turn"}),
+            ),
+            (
+                "item/tool/call",
+                json!({"threadId": "thread", "turnId": null}),
+            ),
+            (
+                "mcpServer/elicitation/request",
+                json!({"threadId": "thread", "turnId": 42}),
+            ),
+            (
+                "item/commandExecution/requestApproval",
+                json!({"threadId": false, "turnId": "turn"}),
+            ),
+            (
+                "item/fileChange/requestApproval",
+                json!({"threadId": "thread", "turnId": ["turn"]}),
+            ),
+            (
+                "item/permissions/requestApproval",
+                json!({"threadId": "thread", "turnId": "turn"}),
+            ),
+            (
+                "item/permissions/requestApproval",
+                json!({"threadId": "thread", "turnId": "turn", "permissions": null}),
+            ),
+            (
+                "item/permissions/requestApproval",
+                json!({"threadId": "thread", "turnId": "turn", "permissions": {"network": {"enabled": "yes"}}}),
+            ),
+        ] {
+            assert!(
+                matches!(
+                    shared
+                        .dispatch(json!({"id": 1, "method": method, "params": params}))
+                        .await,
+                    Err(ClientError::ProtocolViolation { .. })
+                ),
+                "{method}"
+            );
+        }
+        assert!(shared.pending_server_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_response_ids_and_turn_completions() {
+        let (shared, _) = ready_shared();
+        let _waiter = shared.begin_turn(ThreadId::new("thread")).unwrap();
+        shared.bind_turn_id(TurnId::new("turn")).unwrap();
+        for raw in [
+            json!({"id": "1", "result": {}}),
+            json!({"id": 1, "result": {}}),
+            json!({"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "turn", "items": [], "status": "inProgress"}
+            }}),
+            json!({"method": "turn/completed", "params": {
+                "threadId": "thread", "turn": {"id": "other", "items": [], "status": "completed"}
+            }}),
+        ] {
+            assert!(matches!(
+                shared.dispatch(raw).await,
+                Err(ClientError::ProtocolViolation { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_start_response_requires_a_named_string_turn_id() {
+        for result in [
+            json!({}),
+            json!({"turn": {"id": 42}}),
+            json!({"turn": {}}),
+            json!({"turn": ["turn"]}),
+        ] {
+            let (shared, _) = ready_shared();
+            let _waiter = shared.begin_turn(ThreadId::new("thread")).unwrap();
+            let (id, _response) = shared
+                .lock_state()
+                .register_request("turn/start", crate::runtime::RequestPermission::Ready)
+                .unwrap();
+            assert!(matches!(
+                shared.dispatch(json!({"id": id, "result": result})).await,
+                Err(ClientError::ProtocolViolation { .. })
+            ));
+        }
     }
 
     #[tokio::test]

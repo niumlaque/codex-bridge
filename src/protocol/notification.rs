@@ -21,6 +21,7 @@ pub struct TurnStartedNotification {
     /// turn を所有する thread。
     pub thread_id: ThreadId,
     ///開始時点の turn snapshot。
+    #[serde(deserialize_with = "super::deserialize_object")]
     pub turn: Turn,
 }
 
@@ -107,6 +108,7 @@ impl fmt::Debug for AgentMessageDeltaNotification {
 #[non_exhaustive]
 pub struct ThreadStatusChangedNotification {
     pub thread_id: ThreadId,
+    #[serde(deserialize_with = "super::deserialize_object")]
     pub status: ThreadStatus,
 }
 

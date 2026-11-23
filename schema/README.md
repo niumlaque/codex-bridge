@@ -18,12 +18,11 @@ The generated schemas correspond to the Codex CLI version used to run the comman
 
 ## Usage
 
-`codex-bridge` includes these schemas to validate messages received from the Codex App Server.
+`src/protocol/schema.rs` reads known method names from `ServerRequest.json` and `ServerNotification.json`.
+It uses `PermissionsRequestApprovalParams.json` to validate the `permissions` profile that can be reused in approval responses, including the schema definitions it references.
 
-In particular, `src/protocol/schema.rs` embeds the following files at compile time:
-
-- `ServerRequest.json`
-- `ServerNotification.json`
+For incoming messages, the library validates the JSON-RPC envelope and the fields it uses or exposes through typed APIs. It also checks request ID and turn state consistency.
+The library preserves raw JSON for generic and unknown notifications, server requests, and uninterpreted thread items.
 
 ## License
 

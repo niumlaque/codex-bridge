@@ -1,11 +1,14 @@
 use std::{collections::HashSet, sync::OnceLock};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
+#[cfg(test)]
 use crate::ClientError;
 
 const SERVER_REQUEST_SOURCE: &str = include_str!("../../schema/ServerRequest.json");
 const SERVER_NOTIFICATION_SOURCE: &str = include_str!("../../schema/ServerNotification.json");
+const PERMISSION_REQUEST_SOURCE: &str =
+    include_str!("../../schema/PermissionsRequestApprovalParams.json");
 const MAX_VALIDATION_STEPS: usize = 100_000;
 const MAX_VALIDATION_DEPTH: usize = 128;
 const MAX_DIAGNOSTIC_PATH_CHARS: usize = 128;
@@ -62,8 +65,7 @@ const ANNOTATION_SCHEMA_KEYWORDS: &[&str] = &[
     "writeOnly",
 ];
 
-static SERVER_REQUEST_SCHEMA: OnceLock<Value> = OnceLock::new();
-static SERVER_NOTIFICATION_SCHEMA: OnceLock<Value> = OnceLock::new();
+static PERMISSION_REQUEST_SCHEMA: OnceLock<Value> = OnceLock::new();
 static SERVER_REQUEST_METHODS: OnceLock<HashSet<String>> = OnceLock::new();
 static SERVER_NOTIFICATION_METHODS: OnceLock<HashSet<String>> = OnceLock::new();
 
@@ -104,57 +106,32 @@ impl ValidationContext {
 }
 
 pub(crate) fn is_known_server_request_method(method: &str) -> bool {
-    methods(
-        &SERVER_REQUEST_METHODS,
-        schema(&SERVER_REQUEST_SCHEMA, SERVER_REQUEST_SOURCE),
-    )
-    .contains(method)
+    methods(&SERVER_REQUEST_METHODS, SERVER_REQUEST_SOURCE).contains(method)
 }
 
 pub(crate) fn is_known_server_notification_method(method: &str) -> bool {
-    methods(
-        &SERVER_NOTIFICATION_METHODS,
-        schema(&SERVER_NOTIFICATION_SCHEMA, SERVER_NOTIFICATION_SOURCE),
-    )
-    .contains(method)
+    methods(&SERVER_NOTIFICATION_METHODS, SERVER_NOTIFICATION_SOURCE).contains(method)
 }
 
-pub(crate) fn validate_server_request(value: &Value) -> Result<(), ClientError> {
-    validate_document(
-        schema(&SERVER_REQUEST_SCHEMA, SERVER_REQUEST_SOURCE),
+/// Approval Response に再利用する permissions と、その参照先だけを検証する。
+pub(crate) fn validate_permission_profile(value: &Value) -> Result<(), String> {
+    let root = PERMISSION_REQUEST_SCHEMA.get_or_init(|| {
+        let root = parse_schema(PERMISSION_REQUEST_SOURCE);
+        audit_schema_keywords(&root["properties"]["permissions"], &root)
+            .expect("checked-in permission profile JSON Schema must use supported keywords");
+        root
+    });
+    validate(
+        &root["properties"]["permissions"],
         value,
-        "ServerRequest",
+        root,
+        "$",
+        &mut ValidationContext::new(),
     )
 }
 
-pub(crate) fn validate_server_notification(value: &Value) -> Result<(), ClientError> {
-    validate_document(
-        schema(&SERVER_NOTIFICATION_SCHEMA, SERVER_NOTIFICATION_SOURCE),
-        value,
-        "ServerNotification",
-    )
-}
-
-pub(crate) fn validate_thread_item(value: &Value) -> Result<(), ClientError> {
-    validate_server_notification(&json!({
-        "method": "item/started",
-        "params": {
-            "threadId": "schema-validation",
-            "turnId": "schema-validation",
-            "item": value,
-            "startedAtMs": 0
-        }
-    }))
-}
-
-fn schema(lock: &'static OnceLock<Value>, source: &'static str) -> &'static Value {
-    lock.get_or_init(|| {
-        let schema = serde_json::from_str(source)
-            .expect("checked-in app-server JSON Schema must be valid JSON");
-        audit_schema_keywords(&schema)
-            .expect("checked-in app-server JSON Schema uses an unsupported keyword");
-        schema
-    })
+fn parse_schema(source: &str) -> Value {
+    serde_json::from_str(source).expect("checked-in app-server JSON Schema must be valid JSON")
 }
 
 #[cfg(test)]
@@ -163,17 +140,16 @@ pub(super) fn validate_test_document(
     value: &Value,
     name: &str,
 ) -> Result<(), ClientError> {
-    let schema =
-        serde_json::from_str(source).expect("checked-in app-server JSON Schema must be valid JSON");
-    audit_schema_keywords(&schema)
+    let schema = parse_schema(source);
+    audit_schema_keywords(&schema, &schema)
         .expect("checked-in app-server JSON Schema uses an unsupported keyword");
     validate_document(&schema, value, name)
 }
 
-fn methods<'a>(lock: &'a OnceLock<HashSet<String>>, schema: &Value) -> &'a HashSet<String> {
+fn methods<'a>(lock: &'a OnceLock<HashSet<String>>, source: &str) -> &'a HashSet<String> {
     lock.get_or_init(|| {
         let mut methods = HashSet::new();
-        collect_envelope_methods(schema, &mut methods);
+        collect_envelope_methods(&parse_schema(source), &mut methods);
         methods
     })
 }
@@ -208,11 +184,16 @@ fn is_allowed_schema_keyword(keyword: &str) -> bool {
     VALIDATION_SCHEMA_KEYWORDS.contains(&keyword) || ANNOTATION_SCHEMA_KEYWORDS.contains(&keyword)
 }
 
-fn audit_schema_keywords(schema: &Value) -> Result<(), String> {
-    audit_schema_node(schema, "$")
+fn audit_schema_keywords(schema: &Value, root: &Value) -> Result<(), String> {
+    audit_schema_node(schema, root, "$", &mut HashSet::new())
 }
 
-fn audit_schema_node(schema: &Value, path: &str) -> Result<(), String> {
+fn audit_schema_node<'a>(
+    schema: &'a Value,
+    root: &'a Value,
+    path: &str,
+    visited_references: &mut HashSet<&'a str>,
+) -> Result<(), String> {
     match schema {
         Value::Bool(_) => return Ok(()),
         Value::Object(_) => {}
@@ -227,10 +208,28 @@ fn audit_schema_node(schema: &Value, path: &str) -> Result<(), String> {
             ));
         }
         match keyword.as_str() {
+            "$ref" => {
+                let reference = value
+                    .as_str()
+                    .ok_or_else(|| format!("{path} has a non-string JSON Schema reference"))?;
+                if visited_references.insert(reference) {
+                    audit_schema_node(
+                        resolve_reference(root, reference)?,
+                        root,
+                        reference,
+                        visited_references,
+                    )?;
+                }
+            }
             "allOf" | "anyOf" | "oneOf" => {
                 if let Some(children) = value.as_array() {
                     for (index, child) in children.iter().enumerate() {
-                        audit_schema_node(child, &format!("{path}.{keyword}[{index}]"))?;
+                        audit_schema_node(
+                            child,
+                            root,
+                            &format!("{path}.{keyword}[{index}]"),
+                            visited_references,
+                        )?;
                     }
                 }
             }
@@ -242,23 +241,35 @@ fn audit_schema_node(schema: &Value, path: &str) -> Result<(), String> {
             | "additionalItems"
             | "propertyNames"
             | "contains" => {
-                audit_schema_node(value, &format!("{path}.{keyword}"))?;
+                audit_schema_node(
+                    value,
+                    root,
+                    &format!("{path}.{keyword}"),
+                    visited_references,
+                )?;
             }
             "items" => {
                 if let Some(children) = value.as_array() {
                     for (index, child) in children.iter().enumerate() {
-                        audit_schema_node(child, &format!("{path}.items[{index}]"))?;
+                        audit_schema_node(
+                            child,
+                            root,
+                            &format!("{path}.items[{index}]"),
+                            visited_references,
+                        )?;
                     }
                 } else {
-                    audit_schema_node(value, &format!("{path}.items"))?;
+                    audit_schema_node(value, root, &format!("{path}.items"), visited_references)?;
                 }
             }
-            "properties" | "definitions" | "$defs" => {
+            "properties" => {
                 if let Some(children) = value.as_object() {
                     for (name, child) in children {
                         audit_schema_node(
                             child,
+                            root,
                             &format!("{path}.{keyword}.{}", escape_path(name)),
+                            visited_references,
                         )?;
                     }
                 }
@@ -269,7 +280,9 @@ fn audit_schema_node(schema: &Value, path: &str) -> Result<(), String> {
                         if !dependency.is_array() {
                             audit_schema_node(
                                 dependency,
+                                root,
                                 &format!("{path}.dependencies.{}", escape_path(name)),
+                                visited_references,
                             )?;
                         }
                     }
@@ -281,6 +294,7 @@ fn audit_schema_node(schema: &Value, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_document(schema: &Value, value: &Value, name: &str) -> Result<(), ClientError> {
     let mut context = ValidationContext::new();
     validate(schema, value, schema, "$", &mut context).map_err(|reason| {
@@ -726,26 +740,34 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_schemas_use_only_supported_keywords() {
-        for source in [SERVER_REQUEST_SOURCE, SERVER_NOTIFICATION_SOURCE] {
-            let schema: Value = serde_json::from_str(source).unwrap();
-            audit_schema_keywords(&schema).unwrap();
-        }
+    fn permission_profile_audit_visits_only_reachable_definitions() {
+        let root = json!({
+            "definitions": {
+                "profile": {"type": "object"},
+                "unused": {"futureKeyword": true}
+            }
+        });
+        audit_schema_keywords(&json!({"$ref": "#/definitions/profile"}), &root).unwrap();
+        assert!(
+            audit_schema_keywords(&json!({"$ref": "#/definitions/unused"}), &root)
+                .unwrap_err()
+                .contains("futureKeyword")
+        );
     }
 
     #[test]
     fn rejects_unknown_schema_keywords() {
-        let error = audit_schema_keywords(&json!({
+        let schema = json!({
             "type": "object",
             "futureKeyword": true
-        }))
-        .unwrap_err();
+        });
+        let error = audit_schema_keywords(&schema, &schema).unwrap_err();
         assert!(error.contains("futureKeyword"));
     }
 
     #[test]
     fn schema_keyword_audit_ignores_property_and_definition_names() {
-        audit_schema_keywords(&json!({
+        let schema = json!({
             "definitions": {
                 "futureKeyword": {"type": "string"}
             },
@@ -756,62 +778,22 @@ mod tests {
             "dependencies": {
                 "futureKeyword": ["other"]
             }
-        }))
-        .unwrap();
+        });
+        audit_schema_keywords(&schema, &schema).unwrap();
     }
 
     #[test]
-    fn rejects_nested_mcp_and_permission_schema_violations() {
-        assert!(
-            validate_server_request(&json!({
-                "id": "mcp-1",
-                "method": "mcpServer/elicitation/request",
-                "params": {
-                    "serverName": "fixture",
-                    "threadId": "thread-1",
-                    "mode": "form",
-                    "message": "answer",
-                    "requestedSchema": {"properties": {}}
-                }
-            }))
-            .is_err()
-        );
-        assert!(
-            validate_server_request(&json!({
-                "id": "permission-1",
-                "method": "item/permissions/requestApproval",
-                "params": {
-                    "cwd": "/tmp",
-                    "itemId": "item-1",
-                    "permissions": {
-                        "fileSystem": {
-                            "entries": [{
-                                "access": "future",
-                                "path": {"type": "special", "value": {"kind": "root"}}
-                            }]
-                        }
-                    },
-                    "startedAtMs": 1,
-                    "threadId": "thread-1",
-                    "turnId": "turn-1"
-                }
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_nested_thread_item_schema_violations() {
-        assert!(
-            validate_thread_item(&json!({
-                "id": "image-1",
-                "type": "imageGeneration",
-                "result": "ok",
-                "savedPath": 42,
-                "status": "completed"
-            }))
-            .is_err()
-        );
+    fn rejects_nested_permission_profile_schema_violations() {
+        let invalid_profile = json!({
+            "fileSystem": {
+                "entries": [{
+                    "access": "future",
+                    "path": {"type": "special", "value": {"kind": "root"}}
+                }]
+            }
+        });
+        assert!(validate_permission_profile(&invalid_profile).is_err());
+        assert!(serde_json::from_value::<crate::PermissionProfile>(invalid_profile).is_err());
     }
 
     #[test]

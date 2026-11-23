@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
@@ -156,9 +156,17 @@ impl FileChangeApprovalDecision {
 ///
 /// Checked-in Schema が検証した profile を lossless に保持し、response では requested subset を
 /// そのまま grant できる。Field は非公開とし、caller が未検証の profile を組み立てられないようにする。
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct PermissionProfile(Value);
+
+impl<'de> Deserialize<'de> for PermissionProfile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        super::schema::validate_permission_profile(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
 
 impl PermissionProfile {
     /// Terminal 表示や永続化のため、検証済み profile を JSON value として参照する。

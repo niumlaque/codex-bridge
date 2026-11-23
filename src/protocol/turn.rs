@@ -1,7 +1,7 @@
 //! turn/start parameter、turn snapshot、item model、terminal outcome を定義する。
 //!
 //! app-server Schema は多数の item kind を持つが、client が直接利用する agent message だけを専用 variant とし、
-//!その他は validated raw JSON として保持する。これにより Schema validation を維持しながら future item kind を失わない。
+//!その他は ID と種別を検証し、raw JSON として保持する。
 
 use std::{collections::HashMap, fmt};
 
@@ -314,11 +314,18 @@ pub struct Turn {
     #[serde(default)]
     pub duration_ms: Option<i64>,
     /// failed turn の error detail。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_turn_error")]
     pub error: Option<TurnError>,
     /// app-server clock 上の開始時刻。
     #[serde(default)]
     pub started_at: Option<i64>,
+}
+
+fn deserialize_turn_error<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TurnError>, D::Error> {
+    Option::<super::WireObject<TurnError>>::deserialize(deserializer)
+        .map(|error| error.map(|super::WireObject(error)| error))
 }
 
 /// failed turn に付随する server-controlled error detail。
@@ -353,12 +360,12 @@ impl fmt::Debug for TurnError {
 
 /// turn 内の item。
 ///
-///最終 response 抽出に必要な agent message は typed variant とし、その他は Schema validation 済み raw JSON を保持する。
+///最終 response 抽出に必要な agent message は typed variant とし、その他は raw JSON を保持する。
 #[derive(Clone)]
 pub enum ThreadItem {
     /// model が生成した agent message。
     AgentMessage { id: String, text: String },
-    ///専用 public 型を持たない Schema-known item。
+    ///専用 public 型を持たない item。
     Other {
         id: String,
         kind: String,
@@ -390,8 +397,6 @@ impl<'de> Deserialize<'de> for ThreadItem {
         D: Deserializer<'de>,
     {
         let raw = Value::deserialize(deserializer)?;
-        // kind 固有 field を読む前に checked-in Schema 全体で validation し、partially typed な不正 item を拒否する。
-        super::schema::validate_thread_item(&raw).map_err(serde::de::Error::custom)?;
         let object = raw
             .as_object()
             .ok_or_else(|| serde::de::Error::custom("thread item must be an object"))?;
@@ -442,10 +447,16 @@ impl TurnOutcome {
     }
 }
 
-/// turn/start response の wire payload。
+/// turn/start response から active turn との対応付けに使用する情報。
 #[derive(Debug, Deserialize)]
 pub(crate) struct TurnStartResponse {
-    pub turn: Turn,
+    #[serde(deserialize_with = "super::deserialize_object")]
+    pub turn: WireTurn,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WireTurn {
+    pub id: TurnId,
 }
 
 /// turn/completed notification の wire payload。
@@ -453,6 +464,7 @@ pub(crate) struct TurnStartResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TurnCompletedParams {
     pub thread_id: ThreadId,
+    #[serde(deserialize_with = "super::deserialize_object")]
     pub turn: Turn,
 }
 
@@ -483,38 +495,48 @@ mod tests {
     }
 
     #[test]
-    fn known_thread_items_require_nested_schema_types() {
-        assert!(
-            serde_json::from_value::<ThreadItem>(json!({
+    fn other_thread_items_preserve_raw_fields() {
+        for raw in [
+            json!({
                 "id": "cmd-1",
                 "type": "commandExecution",
                 "command": "echo ok",
                 "commandActions": [42],
                 "cwd": "/tmp",
                 "status": "completed"
-            }))
-            .is_err()
-        );
+            }),
+            json!({"id": "user-1", "type": "userMessage", "content": [{"text": 1}]}),
+            json!({"id": "new-1", "type": "futureItem", "details": 42}),
+        ] {
+            let item = serde_json::from_value::<ThreadItem>(raw.clone()).unwrap();
+            let ThreadItem::Other {
+                id,
+                kind,
+                raw: stored,
+            } = item
+            else {
+                panic!("expected raw thread item");
+            };
+            assert_eq!(raw["id"], id);
+            assert_eq!(raw["type"], kind);
+            assert_eq!(stored, raw);
+        }
     }
 
     #[test]
-    fn user_message_validates_nested_user_input() {
-        assert!(
-            serde_json::from_value::<ThreadItem>(json!({
-                "id": "user-1",
-                "type": "userMessage",
-                "content": [{"type": "text", "text": "hello"}]
-            }))
-            .is_ok()
-        );
-        assert!(
-            serde_json::from_value::<ThreadItem>(json!({
-                "id": "user-1",
-                "type": "userMessage",
-                "content": [{"type": "text", "text": 1}]
-            }))
-            .is_err()
-        );
+    fn thread_items_require_string_ids_and_types_and_agent_message_text() {
+        for raw in [
+            json!({"type": "agentMessage", "text": "hello"}),
+            json!({"id": 42, "type": "agentMessage", "text": "hello"}),
+            json!({"id": "item", "text": "hello"}),
+            json!({"id": "item", "type": 42, "text": "hello"}),
+            json!({"id": "item", "type": "agentMessage"}),
+            json!({"id": "item", "type": "agentMessage", "text": 42}),
+            json!({"type": "futureItem"}),
+            json!({"id": 42, "type": "futureItem"}),
+        ] {
+            assert!(serde_json::from_value::<ThreadItem>(raw).is_err());
+        }
     }
 
     #[test]
